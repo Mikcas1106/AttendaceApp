@@ -418,7 +418,7 @@ export default function App() {
       <header className="bg-white/60 dark:bg-black/40 backdrop-blur-3xl border-b border-zinc-200/50 dark:border-white/5 px-8 py-4 flex justify-between items-center sticky top-0 z-10 shadow-sm">
         <div className="flex items-center gap-3">
           <div className="rounded-2xl shadow-md dark:shadow-none shadow-blue-200 overflow-hidden bg-white dark:bg-zinc-900 border border-zinc-200/50 dark:border-zinc-800 flex items-center justify-center w-14 h-14 shrink-0">
-            <img src="/icon.png" alt="ClockedIn Logo" className="w-full h-full object-cover scale-[1.15]" />
+            <img src="./icon.png" alt="ClockedIn Logo" className="w-full h-full object-cover scale-[1.15]" />
           </div>
           <div>
             <h1 className="text-2xl font-bold text-zinc-900 dark:text-white leading-tight tracking-tight">ClockedIn</h1>
