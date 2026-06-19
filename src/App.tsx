@@ -1074,6 +1074,11 @@ export default function App() {
           </div>
         </div>
       </main>
+
+      {/* App Footer */}
+      <footer className="mt-12 mb-8 text-center text-xs font-medium text-zinc-400 dark:text-zinc-600">
+        ClockedIn v1.0.0 • Developed by <strong>Kim Castor</strong>
+      </footer>
     </div>
   );
 }
