@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -8,6 +8,7 @@ function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
+    icon: nativeImage.createFromPath(path.join(__dirname, 'public', 'icon.png')),
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
@@ -190,6 +191,22 @@ ipcMain.handle('export-excel', async (event, records, employeeInfo) => {
       return `${h}:${m.toString().padStart(2, '0')}`;
     };
 
+   
+    const PH_HOLIDAYS = {
+      '01-01': true, '02-25': true, '04-09': true, '05-01': true, 
+      '06-12': true, '08-21': true, '08-31': true, '11-01': true, 
+      '11-30': true, '12-08': true, '12-25': true, '12-30': true, '12-31': true
+    };
+    const MOVABLE_HOLIDAYS_2026 = {
+      '2026-04-02': true, '2026-04-03': true
+    };
+    const checkIsHoliday = (dateStr, remarkStr) => {
+      const d = new Date(dateStr);
+      const mmdd = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const yyyymmdd = `${d.getFullYear()}-${mmdd}`;
+      return PH_HOLIDAYS[mmdd] || MOVABLE_HOLIDAYS_2026[yyyymmdd] || (remarkStr && remarkStr.toLowerCase().includes('holiday')) || (remarkStr && remarkStr.toLowerCase().includes('day') && !remarkStr.toLowerCase().includes('sunday') && !remarkStr.toLowerCase().includes('monday'));
+    };
+
     // Write Records
     let rowNum = 11;
     const sortedDates = Object.keys(records).sort((a,b) => new Date(a).getTime() - new Date(b).getTime());
@@ -238,6 +255,21 @@ ipcMain.handle('export-excel', async (event, records, employeeInfo) => {
       sheet.getCell(`M${rowNum}`).value = tIn && tOut ? formatMinutes(otMins) : '';
       sheet.getCell(`N${rowNum}`).value = tIn && tOut ? formatMinutes(otMins) : '';
       sheet.getCell(`O${rowNum}`).value = tIn && tOut ? formatMinutes(undertimeMins) : '';
+      
+      const isHol = checkIsHoliday(r.date, r.remarks);
+      const isLeave = r.remarks && r.remarks.toLowerCase().includes('leave');
+
+      if (isHol || isLeave) {
+        const color = isLeave ? 'FFD9E1F2' : 'FFC6EFCE'; // Light Blue for leave, Light Green for holiday
+        for(let c = 1; c <= 15; c++) {
+          if (c === 12) continue; // Skip column L
+          sheet.getCell(rowNum, c).fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: color }
+          };
+        }
+      }
       
       rowNum++;
     }

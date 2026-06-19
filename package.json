@@ -1,5 +1,5 @@
 {
-  "name": "attendance-maker",
+  "name": "clockedin",
   "version": "1.0.0",
   "description": "Attendance monitoring app",
   "main": "main.cjs",
