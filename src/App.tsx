@@ -22,6 +22,7 @@ type EmployeeInfo = {
   alarmHours?: number;
   discordWebhook?: string;
   theme?: 'light' | 'dark' | 'system';
+  workLocation?: string;
 };
 
 // Helper for UI computation
@@ -50,7 +51,8 @@ export default function App() {
     alarmEnabled: true,
     alarmHours: 8,
     discordWebhook: '',
-    theme: 'dark'
+    theme: 'dark',
+    workLocation: 'HOME'
   });
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -59,12 +61,15 @@ export default function App() {
   const [punchPromptOpen, setPunchPromptOpen] = useState(false);
   const [punchPromptType, setPunchPromptType] = useState<'timeIn' | 'breakOut' | 'breakIn' | 'timeOut' | null>(null);
   const [punchPromptTime, setPunchPromptTime] = useState('');
+  const [punchPromptLocation, setPunchPromptLocation] = useState('');
   const [punchPromptReason, setPunchPromptReason] = useState('');
   const [tableTab, setTableTab] = useState<'all' | 'leaves'>('all');
   const [recordToDelete, setRecordToDelete] = useState<string | null>(null);
   const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
   const [leaveDateInput, setLeaveDateInput] = useState('');
   const [leaveRemarkInput, setLeaveRemarkInput] = useState('');
+  const [isTestMode, setIsTestMode] = useState(import.meta.env.DEV);
+  const [isAlarmRinging, setIsAlarmRinging] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -134,6 +139,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isTestMode) {
+      fetch('/test-data.json')
+        .then(res => res.json())
+        .then(data => {
+          if (data.records) setRecords(data.records);
+          if (data.employeeInfo) setEmployeeInfo(data.employeeInfo);
+        })
+        .catch(err => console.error("Failed to load test data", err));
+      return;
+    }
+
     if (ipcRenderer) {
       ipcRenderer.invoke('read-data').then((data: Record<string, AttendanceRecord>) => {
         if (data && typeof data === 'object' && !Array.isArray(data)) {
@@ -148,16 +164,34 @@ export default function App() {
           setEmployeeInfo(data);
         }
       });
+    } else {
+      setRecords({});
+      setEmployeeInfo({
+        name: '',
+        position: '',
+        id: '',
+        payrollPeriod: '',
+        alarmEnabled: true,
+        alarmHours: 8,
+        discordWebhook: '',
+        theme: 'dark',
+        workLocation: 'HOME'
+      });
     }
-  }, []);
+  }, [isTestMode]);
 
   const saveRecords = (newRecords: Record<string, AttendanceRecord>) => {
     setRecords(newRecords);
+    if (isTestMode) return; // Prevent test data from overwriting the real production file
     if (ipcRenderer) ipcRenderer.invoke('write-data', newRecords);
   };
 
   const saveSettings = (newInfo: EmployeeInfo) => {
     setEmployeeInfo(newInfo);
+    if (isTestMode) {
+      setIsSettingsOpen(false);
+      return; // Prevent test settings from overwriting the real production file
+    }
     if (ipcRenderer) ipcRenderer.invoke('write-settings', newInfo);
     setIsSettingsOpen(false);
   };
@@ -168,7 +202,7 @@ export default function App() {
     return records[todayStr] || { date: todayStr, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
   };
 
-  const handlePunch = (type: 'timeIn' | 'breakOut' | 'breakIn' | 'timeOut', customTime: string, reason: string = '') => {
+  const handlePunch = (type: 'timeIn' | 'breakOut' | 'breakIn' | 'timeOut', customTime: string, location: string = '', reason: string = '') => {
     const timeStr = customTime || format(currentTime, 'HH:mm');
     const newRecord = { ...getTodayRecord(), [type]: timeStr };
     const newRecords = { ...records, [todayStr]: newRecord };
@@ -176,13 +210,14 @@ export default function App() {
 
     // Discord Webhook Integration
     if (employeeInfo.discordWebhook) {
+      const loc = location.trim() ? location.trim().toUpperCase() : (employeeInfo.workLocation || 'HOME');
       let message = '';
-      if (type === 'timeIn') message = 'IN @ HOME';
-      else if (type === 'timeOut') message = 'OUT @ HOME';
+      if (type === 'timeIn') message = `IN @ ${loc}`;
+      else if (type === 'timeOut') message = `OUT @ ${loc}`;
       else if (type === 'breakOut') {
-        message = reason.trim() ? `BREAK OUT @ HOME (${reason.trim().toUpperCase()})` : 'BREAK OUT @ HOME';
+        message = reason.trim() ? `BREAK OUT @ ${loc} (${reason.trim().toUpperCase()})` : `BREAK OUT @ ${loc}`;
       }
-      else if (type === 'breakIn') message = 'BREAK IN @ HOME';
+      else if (type === 'breakIn') message = `BREAK IN @ ${loc}`;
 
       if (message) {
         fetch(employeeInfo.discordWebhook, {
@@ -230,8 +265,52 @@ export default function App() {
     return Math.max(0, officeMins - breakMins);
   };
 
+  const computeTodayWorkSeconds = () => {
+    const tInStr = todayRecord.timeIn;
+    if (!tInStr) return 0;
+    
+    const tInDate = new Date(currentTime);
+    const [inH, inM] = tInStr.split(':').map(Number);
+    tInDate.setHours(inH, inM, 0, 0);
+
+    let tOutDate = new Date(currentTime);
+    if (todayRecord.timeOut) {
+      const [outH, outM] = todayRecord.timeOut.split(':').map(Number);
+      tOutDate.setHours(outH, outM, 0, 0);
+    }
+
+    let officeSecs = Math.floor((tOutDate.getTime() - tInDate.getTime()) / 1000);
+    if (officeSecs < 0) officeSecs = 0;
+
+    let breakSecs = 0;
+    const bOutStr = todayRecord.breakOut;
+    if (bOutStr) {
+      const bOutDate = new Date(currentTime);
+      const [bOutH, bOutM] = bOutStr.split(':').map(Number);
+      bOutDate.setHours(bOutH, bOutM, 0, 0);
+
+      let bInDate = new Date(currentTime);
+      if (todayRecord.breakIn) {
+        const [bInH, bInM] = todayRecord.breakIn.split(':').map(Number);
+        bInDate.setHours(bInH, bInM, 0, 0);
+      } else if (todayRecord.timeOut) {
+        bInDate = new Date(tOutDate);
+      }
+
+      breakSecs = Math.floor((bInDate.getTime() - bOutDate.getTime()) / 1000);
+      if (breakSecs < 0) breakSecs = 0;
+    }
+
+    return Math.max(0, officeSecs - breakSecs);
+  };
+
   const computeTodayWork = () => {
-    return formatMinutes(computeTodayWorkMins());
+    const totalSecs = computeTodayWorkSeconds();
+    if (totalSecs <= 0) return '0:00:00';
+    const h = Math.floor(totalSecs / 3600);
+    const m = Math.floor((totalSecs % 3600) / 60);
+    const s = totalSecs % 60;
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
   useEffect(() => {
@@ -241,36 +320,61 @@ export default function App() {
     }
   }, []);
 
+  // Loop continuous audio when ringing
+  useEffect(() => {
+    let interval: any;
+    if (isAlarmRinging) {
+      try {
+        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const playBeep = () => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.type = 'square';
+          osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+          osc.frequency.setValueAtTime(1200, audioCtx.currentTime + 0.1);
+          
+          gain.gain.setValueAtTime(0, audioCtx.currentTime);
+          gain.gain.linearRampToValueAtTime(0.5, audioCtx.currentTime + 0.05);
+          gain.gain.setValueAtTime(0.5, audioCtx.currentTime + 0.2);
+          gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
+          
+          osc.start(audioCtx.currentTime);
+          osc.stop(audioCtx.currentTime + 0.3);
+        };
+        playBeep();
+        interval = setInterval(playBeep, 600);
+      } catch (e) {
+        console.error("Audio beep failed", e);
+      }
+    }
+    return () => clearInterval(interval);
+  }, [isAlarmRinging]);
+
   useEffect(() => {
     if (employeeInfo.alarmEnabled === false) {
       setAlarmTriggered(false);
+      setIsAlarmRinging(false);
       return;
     }
 
-    const workMins = computeTodayWorkMins();
-    const targetMins = (employeeInfo.alarmHours || 8) * 60;
+    const workSecs = computeTodayWorkSeconds();
+    const targetSecs = (employeeInfo.alarmHours || 8) * 3600;
     
     // Check if target hours is reached
-    if (workMins >= targetMins && !alarmTriggered && !todayRecord.timeOut) {
-      // Trigger System Beep (3 times)
-      if (window.require) {
-        const { shell } = window.require('electron');
-        shell.beep();
-        setTimeout(() => shell.beep(), 600);
-        setTimeout(() => shell.beep(), 1200);
-      }
+    if (workSecs >= targetSecs && workSecs > 0 && !alarmTriggered && !todayRecord.timeOut) {
+      setIsAlarmRinging(true);
+      setAlarmTriggered(true);
 
-      // Show Desktop Notification
       if (Notification.permission === "granted") {
         new Notification("Shift Complete! 🎉", {
           body: `You have reached exactly ${employeeInfo.alarmHours || 8} hours of work today. Don't forget to Time Out!`
         });
       }
-
-      setAlarmTriggered(true);
-    } else if (workMins < targetMins && alarmTriggered) {
-      // Reset if edited to below target hours or a new day
+    } else if (alarmTriggered && (workSecs < targetSecs || todayRecord.timeOut)) {
       setAlarmTriggered(false);
+      setIsAlarmRinging(false);
     }
   }, [currentTime, todayRecord, alarmTriggered, employeeInfo.alarmEnabled, employeeInfo.alarmHours]);
 
@@ -469,30 +573,40 @@ export default function App() {
               className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
             />
 
-            {punchPromptType === 'breakOut' && (
-              <>
-                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Reason (Optional)</label>
+                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Location</label>
                 <input 
-                  autoFocus
                   type="text" 
+                  value={punchPromptLocation}
+                  onChange={e => setPunchPromptLocation(e.target.value)}
+                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm"
+                  placeholder="e.g. HOME, TRANCO OFFICE"
+                />
+
+                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Reason (Optional)</label>
+                <textarea 
+                  rows={1}
+                  autoFocus={punchPromptType === 'breakOut'}
                   value={punchPromptReason}
-                  onChange={e => setPunchPromptReason(e.target.value)}
+                  onChange={e => {
+                    setPunchPromptReason(e.target.value);
+                    e.target.style.height = 'auto';
+                    e.target.style.height = `${e.target.scrollHeight}px`;
+                  }}
                   onKeyDown={e => {
-                     if (e.key === 'Enter') {
-                        handlePunch(punchPromptType, punchPromptTime, punchPromptReason);
+                     if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
                         setPunchPromptOpen(false);
                      }
                   }}
-                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm"
-                  placeholder="e.g. BROWNOUT, LUNCH"
+                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm resize-none overflow-hidden"
+                  placeholder="e.g. LUNCH, BROWNOUT"
                 />
-              </>
-            )}
 
             <div className="flex justify-end gap-3 mt-2">
               <button onClick={() => setPunchPromptOpen(false)} className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
               <button onClick={() => {
-                handlePunch(punchPromptType, punchPromptTime, punchPromptReason);
+                handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
                 setPunchPromptOpen(false);
               }} className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl transition-colors font-medium text-sm shadow-sm">Confirm Punch</button>
             </div>
@@ -519,7 +633,8 @@ export default function App() {
                 alarmEnabled: formData.get('alarmEnabled') === 'on',
                 alarmHours: Number(formData.get('alarmHours')) || 8,
                 discordWebhook: formData.get('discordWebhook') as string,
-                theme: formData.get('theme') as 'light' | 'dark' | 'system',
+                theme: employeeInfo.theme,
+                workLocation: (formData.get('workLocation') as string) || 'HOME',
               });
             }} className="p-6">
               
@@ -540,6 +655,10 @@ export default function App() {
                     <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Employee ID No.</label>
                     <input name="id" defaultValue={employeeInfo.id} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
                   </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Default Work Location</label>
+                    <input name="workLocation" defaultValue={employeeInfo.workLocation?.trim() || 'HOME'} placeholder="HOME" required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+                  </div>
                 </div>
 
                 {/* Right Column: Integrations & Alarms */}
@@ -556,13 +675,13 @@ export default function App() {
                       </div>
                       <label className="relative inline-flex items-center cursor-pointer">
                         <input type="checkbox" name="alarmEnabled" defaultChecked={employeeInfo.alarmEnabled !== false} className="sr-only peer" />
-                        <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none bg-transparent rounded-full peer peer-checked:after:tranzinc-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white dark:bg-zinc-900 after:border-zinc-300 dark:border-zinc-700 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                        <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-700 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
                       </label>
                     </div>
 
                     <div>
                       <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Target Work Hours</label>
-                      <input type="number" name="alarmHours" min="1" max="24" step="0.5" defaultValue={employeeInfo.alarmHours || 8} className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+                      <input type="number" name="alarmHours" min="0" max="24" step="any" defaultValue={employeeInfo.alarmHours || 8} className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
                     </div>
                   </div>
 
@@ -632,6 +751,22 @@ export default function App() {
         </div>
       )}
 
+      {/* Alarm Ringing Modal */}
+      {isAlarmRinging && (
+        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-md z-[100] flex items-center justify-center p-4">
+          <div className="bg-white/70 dark:bg-[#0a0a0a]/80 backdrop-blur-3xl rounded-3xl shadow-2xl border border-red-500/50 w-full max-w-sm overflow-hidden p-8 animate-pulse text-center">
+            <div className="w-20 h-20 bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 rounded-full flex items-center justify-center mx-auto mb-6">
+              <Clock size={40} className="animate-bounce" />
+            </div>
+            <h3 className="font-black text-2xl text-red-600 dark:text-red-400 mb-2 uppercase tracking-widest">Shift Complete!</h3>
+            <p className="text-zinc-600 dark:text-zinc-400 mb-8 font-medium">You have reached your target of {employeeInfo.alarmHours || 8} hours.</p>
+            
+            <button onClick={() => setIsAlarmRinging(false)} className="w-full py-4 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-colors font-black text-lg shadow-lg shadow-red-600/30 tracking-widest uppercase">
+              Stop Alarm
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Reset Confirmation Modal */}
       {isResetConfirmOpen && (
@@ -842,6 +977,7 @@ export default function App() {
                 onClick={() => {
                   setPunchPromptType('timeIn');
                   setPunchPromptTime('');
+                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
@@ -855,6 +991,7 @@ export default function App() {
                 onClick={() => {
                   setPunchPromptType('breakOut');
                   setPunchPromptTime('');
+                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
@@ -868,6 +1005,7 @@ export default function App() {
                 onClick={() => {
                   setPunchPromptType('breakIn');
                   setPunchPromptTime('');
+                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
@@ -881,6 +1019,7 @@ export default function App() {
                 onClick={() => {
                   setPunchPromptType('timeOut');
                   setPunchPromptTime('');
+                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
@@ -1036,12 +1175,16 @@ export default function App() {
                       <td className="py-4 px-6">
                         <div className="flex items-center gap-2">
                           <div className="relative flex-1">
-                            <input
-                              type="text"
+                            <textarea
+                              rows={1}
                               value={record.remarks}
-                              onChange={(e) => handleRemarkChange(record.date, e.target.value)}
+                              onChange={(e) => {
+                                handleRemarkChange(record.date, e.target.value);
+                                e.target.style.height = 'auto';
+                                e.target.style.height = `${e.target.scrollHeight}px`;
+                              }}
                               placeholder="Add remark..."
-                              className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] hover:border-zinc-300 dark:border-zinc-700 focus:bg-white dark:bg-zinc-900 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 rounded-lg px-3 py-2 outline-none bg-transparent transition-all placeholder:text-zinc-400 dark:text-zinc-500 text-sm font-medium"
+                              className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] hover:border-zinc-300 dark:border-zinc-700 focus:bg-white dark:bg-zinc-900 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 rounded-lg px-3 py-2 outline-none bg-transparent transition-all placeholder:text-zinc-400 dark:text-zinc-500 text-sm font-medium resize-none overflow-hidden leading-tight block"
                             />
                           </div>
                           <button

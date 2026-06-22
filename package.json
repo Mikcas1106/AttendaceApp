@@ -34,7 +34,8 @@
   "build": {
     "appId": "com.attendance.maker",
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "public/icon.png"
     },
     "directories": {
       "output": "release"
