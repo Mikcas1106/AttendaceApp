@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">clockedin</string>
+    <string name="title_activity_main">clockedin</string>
+    <string name="package_name">com.attendance.maker</string>
+    <string name="custom_url_scheme">com.attendance.maker</string>
+</resources>

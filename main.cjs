@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, nativeImage, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -83,6 +83,27 @@ ipcMain.handle('write-settings', (event, data) => {
     return { success: true };
   } catch (err) {
     return { success: false };
+  }
+});
+ipcMain.handle('fetch-discord-messages', async (event, token, channelId) => {
+  try {
+    const cleanToken = token ? token.trim() : '';
+    const cleanChannelId = channelId ? channelId.trim() : '';
+    const res = await fetch(`https://discord.com/api/v10/channels/${cleanChannelId}/messages?limit=100`, {
+      headers: {
+        'Authorization': `Bot ${cleanToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'DiscordBot (https://clockedin.local, 1.0.0)'
+      }
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      return { success: false, error: `Discord API error: ${res.status} ${text}` };
+    }
+    const data = await res.json();
+    return { success: true, messages: data };
+  } catch (err) {
+    return { success: false, error: err.message };
   }
 });
 

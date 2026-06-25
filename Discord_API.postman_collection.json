@@ -1,0 +1,54 @@
+{
+  "info": {
+    "name": "Discord Attendance Sync API",
+    "description": "Collection to test fetching attendance messages from your Discord channel.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Fetch Channel Messages",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bot <YOUR_BOT_TOKEN_HERE>",
+            "type": "text"
+          },
+          {
+            "key": "User-Agent",
+            "value": "DiscordBot (https://clockedin.local, 1.0.0)",
+            "type": "text"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "https://discord.com/api/v10/channels/1338411148177051680/messages?limit=100",
+          "protocol": "https",
+          "host": [
+            "discord",
+            "com"
+          ],
+          "path": [
+            "api",
+            "v10",
+            "channels",
+            "1338411148177051680",
+            "messages"
+          ],
+          "query": [
+            {
+              "key": "limit",
+              "value": "100"
+            }
+          ]
+        }
+      },
+      "response": []
+    }
+  ]
+}

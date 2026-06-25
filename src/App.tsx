@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { format } from 'date-fns';
-import { Upload, Trash2, CalendarPlus, Clock, Download, ArrowRight, ArrowLeft, Coffee, Briefcase, Moon, Sun, User, Calendar, Settings, X, Save } from 'lucide-react';
+import { Upload, Trash2, CalendarPlus, Clock, Download, ArrowRight, ArrowLeft, Coffee, Briefcase, Moon, Sun, User, Calendar, Settings, X, Save, RefreshCw } from 'lucide-react';
+import { Capacitor } from '@capacitor/core';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Share } from '@capacitor/share';
 
 const ipcRenderer = window.require ? window.require('electron').ipcRenderer : null;
 
@@ -21,8 +24,10 @@ type EmployeeInfo = {
   alarmEnabled?: boolean;
   alarmHours?: number;
   discordWebhook?: string;
+  discordUsername?: string;
   theme?: 'light' | 'dark' | 'system';
   workLocation?: string;
+  autoSyncEnabled?: boolean;
 };
 
 // Helper for UI computation
@@ -51,8 +56,10 @@ export default function App() {
     alarmEnabled: true,
     alarmHours: 8,
     discordWebhook: '',
+    discordUsername: 'kimcastor6066',
     theme: 'dark',
-    workLocation: 'HOME'
+    workLocation: 'HOME',
+    autoSyncEnabled: false
   });
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -67,11 +74,15 @@ export default function App() {
   const [recordToDelete, setRecordToDelete] = useState<string | null>(null);
   const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
   const [leaveDateInput, setLeaveDateInput] = useState('');
+  const [leaveEndDateInput, setLeaveEndDateInput] = useState('');
+  const [leaveMode, setLeaveMode] = useState<'single' | 'range'>('single');
   const [leaveRemarkInput, setLeaveRemarkInput] = useState('');
   const [isTestMode, setIsTestMode] = useState(import.meta.env.DEV);
   const [isAlarmRinging, setIsAlarmRinging] = useState(false);
+  const [pendingSettings, setPendingSettings] = useState<EmployeeInfo | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hasAutoSynced = useRef(false);
 
   const handleExportBackup = () => {
     const backupData = {
@@ -125,11 +136,13 @@ export default function App() {
     setIsDarkTheme(isDark);
   }, [employeeInfo.theme]);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [isSyncPreview, setIsSyncPreview] = useState(false);
 
-  const [filterMode, setFilterMode] = useState<'range' | 'month'>('month');
+  const [filterMode, setFilterMode] = useState<'range' | 'month' | 'single'>('month');
   const [startDate, setStartDate] = useState('');
   const [endDate, setEndDate] = useState('');
   const [monthFilter, setMonthFilter] = useState(format(new Date(), 'yyyy-MM'));
+  const [singleDate, setSingleDate] = useState(format(new Date(), 'yyyy-MM-dd'));
 
   const [previewRecords, setPreviewRecords] = useState<Record<string, AttendanceRecord>>({});
 
@@ -137,6 +150,103 @@ export default function App() {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  const handleSyncDiscord = async () => {
+    if (!employeeInfo.discordUsername) {
+      alert('Please configure your Discord Username in Settings first.');
+      return;
+    }
+
+    setIsSyncing(true);
+    try {
+      const targetMonth = filterMode === 'month' ? monthFilter : format(new Date(), 'yyyy-MM');
+      const res = await fetch(`https://discord-scraper-attendance-system.onrender.com/api/messages?month=${targetMonth}&username=${employeeInfo.discordUsername}`);
+      
+      if (!res.ok) throw new Error(`API returned ${res.status}`);
+      
+      const responseData = await res.json();
+      const messagesArray = responseData.messages;
+      
+      if (!Array.isArray(messagesArray)) throw new Error('Invalid format returned by scraper');
+      if (messagesArray.length === 0) {
+        alert('No records found for this month/username!');
+        return;
+      }
+      
+      const newRecords = { ...records };
+      
+      // Process messages from oldest to newest to build daily records correctly
+      const sortedMessages = messagesArray.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      
+      sortedMessages.forEach((m: any) => {
+         const content = m.content.toLowerCase();
+         
+         // Only process messages that belong to the correct name (if sent via bot)
+         if (m.viaAttendanceBot && !content.includes(employeeInfo.name.toLowerCase())) {
+            return;
+         }
+         
+         // Parse the Date from timestamp
+         const dateObj = new Date(m.timestamp);
+         const dateStr = format(dateObj, 'd-MMM-yy');
+         
+         if (!newRecords[dateStr]) {
+            newRecords[dateStr] = {
+               date: dateStr,
+               timeIn: '',
+               breakOut: '',
+               breakIn: '',
+               timeOut: '',
+               remarks: ''
+            };
+         }
+         
+         // Try to extract time from content like (08:44) or use the timestamp time
+         let timeStr = format(dateObj, 'HH:mm');
+         const timeMatch = m.content.match(/\((.*?)\)/);
+         if (timeMatch && timeMatch[1]) {
+             // Keep it simple, just extract the digits
+             const t = timeMatch[1].replace(/[^0-9:]/g, '');
+             if (t.includes(':')) {
+                 timeStr = t;
+                 // Quick am/pm fix if it was provided
+                 if (timeMatch[1].toLowerCase().includes('pm')) {
+                     const [h, min] = t.split(':');
+                     if (parseInt(h) < 12) timeStr = `${parseInt(h) + 12}:${min}`;
+                 }
+                 // Ensure HH:mm padding
+                 const parts = timeStr.split(':');
+                 timeStr = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+             }
+         }
+         
+         if (content.includes('break out')) {
+            newRecords[dateStr].breakOut = timeStr;
+         } else if (content.includes('break in')) {
+            newRecords[dateStr].breakIn = timeStr;
+         } else if (content.includes('out')) {
+            newRecords[dateStr].timeOut = timeStr;
+         } else if (content.includes('in')) {
+            // Check if timeIn already exists so we don't overwrite it with a later 'in'
+            if (!newRecords[dateStr].timeIn) {
+               newRecords[dateStr].timeIn = timeStr;
+            }
+         }
+      });
+      
+      setPreviewRecords(newRecords);
+      setIsSyncPreview(true);
+      setIsPreviewOpen(true);
+      // alert(`Successfully synced ${Object.keys(newRecords).length} unique records from ${messagesArray.length} messages!`);
+    } catch (e: any) {
+      console.error(e);
+      alert('Failed to sync from Discord: ' + e.message);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
 
   useEffect(() => {
     if (isTestMode) {
@@ -165,59 +275,111 @@ export default function App() {
         }
       });
     } else {
-      setRecords({});
-      setEmployeeInfo({
-        name: '',
-        position: '',
-        id: '',
-        payrollPeriod: '',
-        alarmEnabled: true,
-        alarmHours: 8,
-        discordWebhook: '',
-        theme: 'dark',
-        workLocation: 'HOME'
-      });
+      // APK / Browser Fallback
+      const localData = localStorage.getItem('attendance_records');
+      if (localData) {
+        setRecords(JSON.parse(localData));
+      } else {
+        setRecords({});
+      }
+
+      const localSettings = localStorage.getItem('attendance_settings');
+      if (localSettings) {
+        setEmployeeInfo(JSON.parse(localSettings));
+      } else {
+        setEmployeeInfo({
+          name: '',
+          position: '',
+          id: '',
+          payrollPeriod: '',
+          alarmEnabled: true,
+          alarmHours: 8,
+          discordWebhook: '',
+          discordUsername: '',
+          theme: 'dark',
+          workLocation: 'HOME',
+          autoSyncEnabled: false
+        });
+      }
     }
   }, [isTestMode]);
+
+  useEffect(() => {
+    if (!employeeInfo.autoSyncEnabled || !employeeInfo.discordUsername) return;
+    if (hasAutoSynced.current) return;
+    
+    hasAutoSynced.current = true;
+    setIsSyncing(true); // Show loading modal immediately
+
+    // Slight delay to ensure UI is ready before actually fetching
+    const timer = setTimeout(() => {
+      handleSyncDiscord();
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [employeeInfo.autoSyncEnabled, employeeInfo.discordUsername]);
 
   const saveRecords = (newRecords: Record<string, AttendanceRecord>) => {
     setRecords(newRecords);
     if (isTestMode) return; // Prevent test data from overwriting the real production file
-    if (ipcRenderer) ipcRenderer.invoke('write-data', newRecords);
+    if (ipcRenderer) {
+      ipcRenderer.invoke('write-data', newRecords);
+    } else {
+      localStorage.setItem('attendance_records', JSON.stringify(newRecords));
+    }
   };
 
   const saveSettings = (newInfo: EmployeeInfo) => {
     setEmployeeInfo(newInfo);
     if (isTestMode) {
       setIsSettingsOpen(false);
-      return; // Prevent test settings from overwriting the real production file
+      return;
     }
-    if (ipcRenderer) ipcRenderer.invoke('write-settings', newInfo);
+    if (ipcRenderer) {
+      ipcRenderer.invoke('write-settings', newInfo);
+    } else {
+      localStorage.setItem('attendance_settings', JSON.stringify(newInfo));
+    }
     setIsSettingsOpen(false);
   };
 
   const todayStr = format(currentTime, 'd-MMM-yy');
 
   const getTodayRecord = (): AttendanceRecord => {
-    return records[todayStr] || { date: todayStr, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
+    const todayStr = format(currentTime, 'd-MMM-yy');
+    const yesterdayStr = format(new Date(currentTime.getTime() - 86400000), 'd-MMM-yy');
+    
+    const todayRecordObj = records[todayStr];
+    const yesterdayRecordObj = records[yesterdayStr];
+
+    // If today hasn't started yet, and yesterday's shift is still open (no timeOut),
+    // treat the "current active dashboard record" as yesterday's shift so they can Time Out.
+    if (!todayRecordObj?.timeIn && yesterdayRecordObj?.timeIn && !yesterdayRecordObj?.timeOut) {
+      return yesterdayRecordObj;
+    }
+
+    return todayRecordObj || { date: todayStr, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
   };
 
   const handlePunch = (type: 'timeIn' | 'breakOut' | 'breakIn' | 'timeOut', customTime: string, location: string = '', reason: string = '') => {
     const timeStr = customTime || format(currentTime, 'HH:mm');
-    const newRecord = { ...getTodayRecord(), [type]: timeStr };
-    const newRecords = { ...records, [todayStr]: newRecord };
+    const targetRecord = getTodayRecord();
+    const newRecord = { ...targetRecord, [type]: timeStr };
+    if (reason.trim()) {
+      newRecord.remarks = newRecord.remarks ? `${newRecord.remarks} | ${reason.trim()}` : reason.trim();
+    }
+    const newRecords = { ...records, [targetRecord.date]: newRecord };
     saveRecords(newRecords);
 
     // Discord Webhook Integration
     if (employeeInfo.discordWebhook) {
       const loc = location.trim() ? location.trim().toUpperCase() : (employeeInfo.workLocation || 'HOME');
       let message = '';
-      if (type === 'timeIn') message = `IN @ ${loc}`;
-      else if (type === 'timeOut') message = `OUT @ ${loc}`;
-      else if (type === 'breakOut') {
-        message = reason.trim() ? `BREAK OUT @ ${loc} (${reason.trim().toUpperCase()})` : `BREAK OUT @ ${loc}`;
-      }
-      else if (type === 'breakIn') message = `BREAK IN @ ${loc}`;
+      const formattedReason = reason.trim() ? ` (${reason.trim().toUpperCase()})` : '';
+      
+      if (type === 'timeIn') message = `IN @ ${loc}${formattedReason}`;
+      else if (type === 'timeOut') message = `OUT @ ${loc}${formattedReason}`;
+      else if (type === 'breakOut') message = `BREAK OUT @ ${loc}${formattedReason}`;
+      else if (type === 'breakIn') message = `BREAK IN @ ${loc}${formattedReason}`;
 
       if (message) {
         fetch(employeeInfo.discordWebhook, {
@@ -248,7 +410,10 @@ export default function App() {
     }
 
     let officeMins = 0;
-    if (tOut !== null) officeMins = tOut - tIn;
+    if (tOut !== null) {
+      officeMins = tOut - tIn;
+      if (officeMins < 0) officeMins += 24 * 60; // Handle overnight shift
+    }
 
     let breakMins = 0;
     const bOut = parseTime(todayRecord.breakOut);
@@ -259,6 +424,7 @@ export default function App() {
       }
       if (bIn !== null) {
         breakMins = bIn - bOut;
+        if (breakMins < 0) breakMins += 24 * 60; // Handle overnight break
       }
     }
 
@@ -280,7 +446,7 @@ export default function App() {
     }
 
     let officeSecs = Math.floor((tOutDate.getTime() - tInDate.getTime()) / 1000);
-    if (officeSecs < 0) officeSecs = 0;
+    if (officeSecs < 0) officeSecs += 24 * 3600; // Handle overnight shift
 
     let breakSecs = 0;
     const bOutStr = todayRecord.breakOut;
@@ -298,7 +464,7 @@ export default function App() {
       }
 
       breakSecs = Math.floor((bInDate.getTime() - bOutDate.getTime()) / 1000);
-      if (breakSecs < 0) breakSecs = 0;
+      if (breakSecs < 0) breakSecs += 24 * 3600; // Handle overnight break
     }
 
     return Math.max(0, officeSecs - breakSecs);
@@ -315,7 +481,7 @@ export default function App() {
 
   useEffect(() => {
     // Request notification permission on startup
-    if (Notification.permission !== "granted" && Notification.permission !== "denied") {
+    if (typeof Notification !== 'undefined' && Notification.permission !== "granted" && Notification.permission !== "denied") {
       Notification.requestPermission();
     }
   }, []);
@@ -367,7 +533,7 @@ export default function App() {
       setIsAlarmRinging(true);
       setAlarmTriggered(true);
 
-      if (Notification.permission === "granted") {
+      if (typeof Notification !== 'undefined' && Notification.permission === "granted") {
         new Notification("Shift Complete! 🎉", {
           body: `You have reached exactly ${employeeInfo.alarmHours || 8} hours of work today. Don't forget to Time Out!`
         });
@@ -423,13 +589,17 @@ export default function App() {
           targetDays.push(new Date(parseInt(year), parseInt(month) - 1, i));
         }
       }
-    } else {
+    } else if (filterMode === 'range') {
       if (startDate && endDate) {
         const s = new Date(startDate);
         const e = new Date(endDate);
         for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
           targetDays.push(new Date(d));
         }
+      }
+    } else if (filterMode === 'single') {
+      if (singleDate) {
+        targetDays.push(new Date(singleDate));
       }
     }
 
@@ -446,11 +616,6 @@ export default function App() {
       const dateStr = format(d, 'd-MMM-yy');
       const existing = sourceRecords[dateStr];
       
-      // If it's a weekend and there's no explicit record, do NOT add it to the view.
-      if (isWeekend && !existing) {
-        return;
-      }
-      
       let remarks = existing?.remarks || '';
       
       // Auto-detect holiday if remarks are empty
@@ -459,14 +624,19 @@ export default function App() {
         if (holiday) remarks = holiday;
       }
 
-      uniqueMap.set(dateStr, {
-        date: dateStr,
-        timeIn: existing?.timeIn || '',
-        breakOut: existing?.breakOut || '',
-        breakIn: existing?.breakIn || '',
-        timeOut: existing?.timeOut || '',
-        remarks
-      });
+      // Show missing dates as well to provide a complete view
+      if (!existing) {
+        uniqueMap.set(dateStr, {
+          date: dateStr,
+          timeIn: '',
+          breakOut: '',
+          breakIn: '',
+          timeOut: '',
+          remarks: isWeekend && !remarks ? 'Weekend' : remarks
+        });
+      } else {
+        uniqueMap.set(dateStr, existing);
+      }
     });
 
     return Array.from(uniqueMap.values())
@@ -483,6 +653,7 @@ export default function App() {
 
   const handleOpenPreview = () => {
     setPreviewRecords(records);
+    setIsSyncPreview(false);
     setIsPreviewOpen(true);
   };
 
@@ -508,32 +679,155 @@ export default function App() {
           computedPeriod = `Up to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
         }
       }
-      
+
       const infoToExport = { ...employeeInfo, payrollPeriod: computedPeriod };
       ipcRenderer.invoke('export-excel', filteredDict, infoToExport);
+    } else {
+      // Browser / APK Fallback for Excel Export
+      exportExcelWeb(filteredDict, { ...employeeInfo, payrollPeriod: computedPeriod });
     }
     setIsPreviewOpen(false);
+  };
+
+  const exportExcelWeb = async (recordsData: Record<string, AttendanceRecord>, info: EmployeeInfo) => {
+    try {
+      // Dynamically import to avoid breaking Capacitor/Vite on initial load
+      const ExcelJS = (await import('exceljs')).default;
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Timesheet');
+
+      sheet.getColumn('A').width = 15;
+      sheet.getColumn('B').width = 15;
+      sheet.getColumn('C').width = 15;
+      sheet.getColumn('D').width = 15;
+      sheet.getColumn('E').width = 15;
+      sheet.getColumn('F').width = 15;
+      sheet.getColumn('G').width = 15;
+      sheet.getColumn('H').width = 15;
+      sheet.getColumn('I').width = 30;
+
+      sheet.addRow(['EMPLOYEE NAME:', info.name]);
+      sheet.addRow(['POSITION:', info.position]);
+      sheet.addRow(['ID NUMBER:', info.id]);
+      sheet.addRow(['PAYROLL PERIOD:', info.payrollPeriod]);
+      sheet.addRow([]);
+
+      sheet.addRow([
+        'Date', 'Time In', 'Break Out', 'Break In', 'Time Out',
+        'Total Work Hours', 'Total Overtime', 'Undertime', 'Remarks'
+      ]).font = { bold: true };
+
+      const recordsList = Object.values(recordsData).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      let totalWorkMinsSum = 0;
+      let totalOTMinsSum = 0;
+      let totalUTMinsSum = 0;
+
+      recordsList.forEach(r => {
+        let work = 0;
+        let ut = 0;
+        let ot = 0;
+
+        const tIn = parseTime(r.timeIn);
+        const tOut = parseTime(r.timeOut);
+        if (tIn !== null && tOut !== null) {
+          let mins = tOut - tIn;
+          const bOut = parseTime(r.breakOut);
+          const bIn = parseTime(r.breakIn);
+          if (bOut !== null && bIn !== null) {
+             const breakDuration = bIn - bOut;
+             if (breakDuration > 0) mins -= breakDuration;
+          }
+          if (mins < 0) mins = 0;
+
+          work = mins;
+          const REQUIRED_MINS = 8 * 60;
+          if (work < REQUIRED_MINS) {
+            ut = REQUIRED_MINS - work;
+          } else if (work > REQUIRED_MINS) {
+            ot = work - REQUIRED_MINS;
+          }
+        }
+
+        totalWorkMinsSum += work;
+        totalUTMinsSum += ut;
+        totalOTMinsSum += ot;
+
+        sheet.addRow([
+          r.date, r.timeIn, r.breakOut, r.breakIn, r.timeOut,
+          formatMinutes(work), formatMinutes(ot), formatMinutes(ut), r.remarks
+        ]);
+      });
+
+      sheet.addRow([]);
+      sheet.addRow(['TOTALS', '', '', '', '', formatMinutes(totalWorkMinsSum), formatMinutes(totalOTMinsSum), formatMinutes(totalUTMinsSum), '']).font = { bold: true };
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const fileName = `Attendance_${info.name.replace(/\s+/g, '_')}_${info.payrollPeriod.replace(/[\\/:*?"<>|]/g, '')}.xlsx`;
+
+      if (Capacitor.isNativePlatform()) {
+        const bytes = new Uint8Array(buffer as ArrayBuffer);
+        let binary = '';
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64Str = window.btoa(binary);
+
+        const savedFile = await Filesystem.writeFile({
+          path: fileName,
+          data: base64Str,
+          directory: Directory.Cache,
+        });
+
+        await Share.share({
+          title: fileName,
+          url: savedFile.uri,
+        });
+      } else {
+        const blob = new Blob([buffer as ArrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      }
+
+    } catch (error: any) {
+      console.error('Failed to export Excel natively in browser', error);
+      alert('Failed to generate Excel file: ' + (error?.message || error));
+    }
+  };
+
+  const handleConfirmSync = () => {
+    saveRecords(previewRecords);
+    setIsPreviewOpen(false);
+    setIsSyncPreview(false);
+    alert('Sync successfully applied to your dashboard!');
   };
 
   return (
     <div className="min-h-screen relative text-zinc-800 dark:text-zinc-200 font-sans selection:bg-blue-100 selection:text-blue-900">
       <div className="liquid-bg"></div>
       {/* Top Navbar */}
-      <header className="bg-white/60 dark:bg-black/40 backdrop-blur-3xl border-b border-zinc-200/50 dark:border-white/5 px-8 py-4 flex justify-between items-center sticky top-0 z-10 shadow-sm">
-        <div className="flex items-center gap-3">
-          <div className="rounded-2xl shadow-md dark:shadow-none shadow-blue-200 overflow-hidden bg-white dark:bg-zinc-900 border border-zinc-200/50 dark:border-zinc-800 flex items-center justify-center w-14 h-14 shrink-0">
+      <header className="bg-white/60 dark:bg-black/40 backdrop-blur-3xl border-b border-zinc-200/50 dark:border-white/5 px-4 md:px-8 py-3 md:py-4 flex justify-between items-center sticky top-0 z-10 shadow-sm">
+        <div className="flex items-center gap-2 md:gap-3">
+          <div className="rounded-xl md:rounded-2xl shadow-md dark:shadow-none shadow-blue-200 overflow-hidden bg-white dark:bg-zinc-900 border border-zinc-200/50 dark:border-zinc-800 flex items-center justify-center w-10 h-10 md:w-14 md:h-14 shrink-0">
             <img src="./icon.png" alt="ClockedIn Logo" className="w-full h-full object-cover scale-[1.15]" />
           </div>
           <div>
-            <h1 className="text-2xl font-bold text-zinc-900 dark:text-white leading-tight tracking-tight">ClockedIn</h1>
-            <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 font-semibold tracking-wide uppercase mt-0.5">Time & Attendance</p>
+            <h1 className="text-lg md:text-2xl font-bold text-zinc-900 dark:text-white leading-tight tracking-tight">ClockedIn</h1>
+            <p className="hidden sm:block text-[10px] md:text-xs text-zinc-500 dark:text-zinc-400 font-semibold tracking-wide uppercase mt-0.5">Time & Attendance</p>
           </div>
         </div>
 
-        <div className="flex items-center gap-6">
-          <div className="flex flex-col items-end">
-            <span className="text-sm font-bold text-zinc-900 dark:text-white">{employeeInfo.name}</span>
-            <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium">{employeeInfo.position} • ID: {employeeInfo.id}</span>
+        <div className="flex items-center gap-3 md:gap-6">
+          <div className="hidden sm:flex flex-col items-end">
+            <span className="text-sm font-bold text-zinc-900 dark:text-white">{employeeInfo.name || 'User'}</span>
+            <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium">{employeeInfo.position || 'Employee'} {employeeInfo.id ? `• ID: ${employeeInfo.id}` : ''}</span>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -541,17 +835,17 @@ export default function App() {
                 const newTheme = isDarkTheme ? 'light' : 'dark';
                 saveSettings({ ...employeeInfo, theme: newTheme });
               }}
-              className="w-10 h-10 bg-zinc-100 dark:bg-zinc-800/50 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-full flex items-center justify-center border border-zinc-200/50 dark:border-white/[0.08] text-zinc-600 dark:text-zinc-400 transition-colors shadow-sm dark:shadow-none cursor-pointer"
+              className="w-9 h-9 md:w-10 md:h-10 bg-zinc-100 dark:bg-zinc-800/50 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-full flex items-center justify-center border border-zinc-200/50 dark:border-white/[0.08] text-zinc-600 dark:text-zinc-400 transition-colors shadow-sm dark:shadow-none cursor-pointer"
               title={isDarkTheme ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
             >
-              {isDarkTheme ? <Sun size={20} /> : <Moon size={20} />}
+              {isDarkTheme ? <Sun size={18} /> : <Moon size={18} />}
             </button>
             <button
               onClick={() => setIsSettingsOpen(true)}
-              className="w-10 h-10 bg-zinc-100 dark:bg-zinc-800/50 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-full flex items-center justify-center border border-zinc-200/50 dark:border-white/[0.08] text-zinc-600 dark:text-zinc-400 transition-colors shadow-sm dark:shadow-none cursor-pointer"
+              className="w-9 h-9 md:w-10 md:h-10 bg-zinc-100 dark:bg-zinc-800/50 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-full flex items-center justify-center border border-zinc-200/50 dark:border-white/[0.08] text-zinc-600 dark:text-zinc-400 transition-colors shadow-sm dark:shadow-none cursor-pointer"
               title="Edit Information"
             >
-              <User size={20} />
+              <User size={18} />
             </button>
           </div>
         </div>
@@ -617,15 +911,15 @@ export default function App() {
       {/* Settings Modal */}
       {isSettingsOpen && (
         <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl shadow-xl dark:shadow-2xl dark:shadow-black/50 w-full max-w-4xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-800/30">
+          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl shadow-xl dark:shadow-2xl dark:shadow-black/50 w-full max-w-4xl max-h-[90dvh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+            <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-800/30 shrink-0">
               <h3 className="font-bold text-lg flex items-center gap-2"><Settings size={18} className="text-blue-600 dark:text-blue-400" /> Settings & Preferences</h3>
               <button onClick={() => setIsSettingsOpen(false)} className="text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:text-zinc-400 dark:text-zinc-500"><X size={20} /></button>
             </div>
             <form onSubmit={(e) => {
               e.preventDefault();
               const formData = new FormData(e.currentTarget);
-              saveSettings({
+              setPendingSettings({
                 name: formData.get('name') as string,
                 position: formData.get('position') as string,
                 id: formData.get('id') as string,
@@ -633,10 +927,12 @@ export default function App() {
                 alarmEnabled: formData.get('alarmEnabled') === 'on',
                 alarmHours: Number(formData.get('alarmHours')) || 8,
                 discordWebhook: formData.get('discordWebhook') as string,
+                discordUsername: formData.get('discordUsername') as string,
+                autoSyncEnabled: formData.get('autoSyncEnabled') === 'on',
                 theme: employeeInfo.theme,
                 workLocation: (formData.get('workLocation') as string) || 'HOME',
               });
-            }} className="p-6">
+            }} className="p-6 overflow-y-auto flex-1">
               
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 {/* Left Column: Personal Info */}
@@ -644,19 +940,19 @@ export default function App() {
                   <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><User size={16} className="text-blue-500 dark:text-blue-400"/> Personal Details</h4>
                   
                   <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Full Name</label>
+                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Full Name <span className="text-red-500">*</span></label>
                     <input name="name" defaultValue={employeeInfo.name} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
                   </div>
                   <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Position</label>
+                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Position <span className="text-red-500">*</span></label>
                     <input name="position" defaultValue={employeeInfo.position} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
                   </div>
                   <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Employee ID No.</label>
+                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Employee ID No. <span className="text-red-500">*</span></label>
                     <input name="id" defaultValue={employeeInfo.id} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
                   </div>
                   <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Default Work Location</label>
+                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Default Work Location <span className="text-red-500">*</span></label>
                     <input name="workLocation" defaultValue={employeeInfo.workLocation?.trim() || 'HOME'} placeholder="HOME" required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
                   </div>
                 </div>
@@ -689,9 +985,24 @@ export default function App() {
                   <div className="flex flex-col gap-4">
                     <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2">💬 Discord Integration</h4>
                     <div>
-                      <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Discord Webhook URL (Optional)</label>
-                      <input name="discordWebhook" type="url" defaultValue={employeeInfo.discordWebhook} placeholder="https://discord.com/api/webhooks/..." className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm" />
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">If provided, punches (Time In, Time Out, etc.) will be automatically sent to your Discord channel.</p>
+                      <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Discord Webhook URL <span className="text-red-500">*</span></label>
+                      <input name="discordWebhook" type="url" required defaultValue={employeeInfo.discordWebhook} placeholder="https://discord.com/api/webhooks/..." className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm" />
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">Punches (Time In, Time Out, etc.) will be automatically sent to your Discord channel.</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Discord Username (For Syncing) <span className="text-red-500">*</span></label>
+                      <input name="discordUsername" type="text" required defaultValue={employeeInfo.discordUsername} placeholder="e.g. kimcastor6066" className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 font-mono text-sm" />
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">Used to pull past records from the Discord Scraper API.</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300">Auto Sync on Startup</label>
+                        <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Automatically sync from Discord every time you open the app.</p>
+                      </div>
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" name="autoSyncEnabled" defaultChecked={employeeInfo.autoSyncEnabled === true} className="sr-only peer" />
+                        <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-700 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                      </label>
                     </div>
                   </div>
 
@@ -747,6 +1058,53 @@ export default function App() {
                 </div>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Settings Confirm Modal */}
+      {pendingSettings && (
+        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-xl w-full max-w-sm overflow-hidden animate-in zoom-in-95 duration-200 border border-zinc-200 dark:border-zinc-800">
+            <div className="p-6 text-center">
+              <div className="w-12 h-12 bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Save size={24} />
+              </div>
+              <h3 className="font-bold text-lg text-zinc-900 dark:text-zinc-100 mb-2">Save Details?</h3>
+              <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-6">Are you sure you want to save these changes to your settings and preferences?</p>
+              <div className="flex gap-3 justify-center">
+                <button 
+                  onClick={() => setPendingSettings(null)}
+                  className="px-4 py-2 font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-xl transition-colors"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={() => {
+                    if (pendingSettings) {
+                      saveSettings(pendingSettings);
+                      setPendingSettings(null);
+                    }
+                  }}
+                  className="px-6 py-2 font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors shadow-sm"
+                >
+                  Confirm Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Syncing Loading Modal */}
+      {isSyncing && (
+        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-md z-[100] flex items-center justify-center p-4">
+          <div className="bg-white/70 dark:bg-[#0a0a0a]/80 backdrop-blur-3xl rounded-3xl shadow-2xl border border-blue-500/30 w-full max-w-sm overflow-hidden p-8 text-center animate-in fade-in duration-200">
+            <div className="w-16 h-16 bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center mx-auto mb-6">
+              <RefreshCw size={32} className="animate-spin" />
+            </div>
+            <h3 className="font-bold text-xl text-zinc-900 dark:text-white mb-2">Syncing with Discord...</h3>
+            <p className="text-sm text-zinc-500 dark:text-zinc-400">Please wait while we fetch your latest attendance records. This may take a few moments.</p>
           </div>
         </div>
       )}
@@ -826,41 +1184,98 @@ export default function App() {
       {/* Future Leave Modal */}
       {isLeaveModalOpen && (
         <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm overflow-hidden p-6 animate-in fade-in zoom-in-95 duration-200">
+          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm max-h-[90dvh] flex flex-col overflow-y-auto p-6 animate-in fade-in zoom-in-95 duration-200">
             <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Add Future Leave</h3>
             <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">Mark a future date as Leave, Absent, or Holiday.</p>
             
-            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date</label>
-            <input 
-              type="date" 
-              value={leaveDateInput}
-              onChange={e => setLeaveDateInput(e.target.value)}
-              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
-            />
+            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date Mode</label>
+            <select
+              value={leaveMode}
+              onChange={e => setLeaveMode(e.target.value as 'single' | 'range')}
+              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-medium"
+            >
+              <option value="single">Single Date</option>
+              <option value="range">Date Range</option>
+            </select>
+
+            {leaveMode === 'single' ? (
+              <>
+                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date</label>
+                <input 
+                  type="date" 
+                  value={leaveDateInput}
+                  onChange={e => setLeaveDateInput(e.target.value)}
+                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
+                />
+              </>
+            ) : (
+              <div className="flex gap-4 mb-4">
+                <div className="flex-1">
+                  <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Start Date</label>
+                  <input 
+                    type="date" 
+                    value={leaveDateInput}
+                    onChange={e => setLeaveDateInput(e.target.value)}
+                    className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 text-sm font-mono"
+                  />
+                </div>
+                <div className="flex-1">
+                  <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">End Date</label>
+                  <input 
+                    type="date" 
+                    value={leaveEndDateInput}
+                    onChange={e => setLeaveEndDateInput(e.target.value)}
+                    className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 text-sm font-mono"
+                  />
+                </div>
+              </div>
+            )}
 
             <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Leave Type / Remark</label>
-            <input 
-              type="text" 
+            <textarea 
+              rows={1}
               value={leaveRemarkInput}
-              onChange={e => setLeaveRemarkInput(e.target.value)}
-              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm"
+              onChange={e => {
+                setLeaveRemarkInput(e.target.value);
+                e.target.style.height = 'auto';
+                e.target.style.height = `${e.target.scrollHeight}px`;
+              }}
+              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm resize-none overflow-hidden"
               placeholder="e.g. Vacation Leave, Sick Leave"
             />
 
             <div className="flex justify-end gap-3 mt-2">
               <button onClick={() => setIsLeaveModalOpen(false)} className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
               <button onClick={() => {
-                if (!leaveDateInput) return;
-                const dateKey = format(new Date(leaveDateInput), 'd-MMM-yy');
                 const newRecords = { ...records };
-                if (!newRecords[dateKey]) {
-                  newRecords[dateKey] = {
-                    date: dateKey,
-                    timeIn: '', timeOut: '', breakOut: '', breakIn: '',
-                    remarks: leaveRemarkInput
-                  };
+                if (leaveMode === 'single') {
+                  if (!leaveDateInput) return;
+                  const dateKey = format(new Date(leaveDateInput), 'd-MMM-yy');
+                  if (!newRecords[dateKey]) {
+                    newRecords[dateKey] = {
+                      date: dateKey,
+                      timeIn: '', timeOut: '', breakOut: '', breakIn: '',
+                      remarks: leaveRemarkInput
+                    };
+                  } else {
+                    newRecords[dateKey].remarks = leaveRemarkInput;
+                  }
                 } else {
-                  newRecords[dateKey].remarks = leaveRemarkInput;
+                  if (!leaveDateInput || !leaveEndDateInput) return;
+                  const s = new Date(leaveDateInput);
+                  const e = new Date(leaveEndDateInput);
+                  for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+                    const dateKey = format(d, 'd-MMM-yy');
+                    if (!newRecords[dateKey]) {
+                      newRecords[dateKey] = {
+                        date: dateKey,
+                        timeIn: '', timeOut: '', breakOut: '', breakIn: '',
+                        remarks: leaveRemarkInput
+                      };
+                    } else {
+                      newRecords[dateKey].remarks = leaveRemarkInput;
+                    }
+                  }
                 }
                 saveRecords(newRecords);
                 setIsLeaveModalOpen(false);
@@ -876,8 +1291,14 @@ export default function App() {
           <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl shadow-xl dark:shadow-2xl dark:shadow-black/50 w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
             <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-800/30 shrink-0">
               <div>
-                <h3 className="font-bold text-lg text-zinc-900 dark:text-white">Preview & Edit Data</h3>
-                <p className="text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Make any final adjustments before generating the Excel file.</p>
+                <h3 className="font-bold text-lg text-zinc-900 dark:text-white">
+                  {isSyncPreview ? "Preview Scraped Data" : "Preview & Edit Data"}
+                </h3>
+                <p className="text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
+                  {isSyncPreview 
+                    ? "Review the scraped attendance records before applying them to your dashboard." 
+                    : "Make any final adjustments before generating the Excel file."}
+                </p>
               </div>
               <button onClick={() => setIsPreviewOpen(false)} className="text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:text-zinc-400 dark:text-zinc-500"><X size={20} /></button>
             </div>
@@ -929,16 +1350,24 @@ export default function App() {
               <button onClick={() => setIsPreviewOpen(false)} className="px-5 py-2 rounded-lg font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-700 transition-colors">
                 Cancel
               </button>
-              <button onClick={handleConfirmExport} className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-6 py-2 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors active:scale-95" disabled={filteredPreviewList.length === 0}>
-                <Download size={18} />
-                Confirm & Export
-              </button>
+              
+              {isSyncPreview ? (
+                <button onClick={handleConfirmSync} className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors active:scale-95" disabled={filteredPreviewList.length === 0}>
+                  <RefreshCw size={18} />
+                  Confirm & Apply Sync
+                </button>
+              ) : (
+                <button onClick={handleConfirmExport} className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-6 py-2 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors active:scale-95" disabled={filteredPreviewList.length === 0}>
+                  <Download size={18} />
+                  Confirm & Export
+                </button>
+              )}
             </div>
           </div>
         </div>
       )}
 
-      <main className="max-w-7xl mx-auto px-8 py-8 flex flex-col gap-8">
+      <main className="max-w-7xl mx-auto px-4 md:px-8 py-6 md:py-8 flex flex-col gap-6 md:gap-8">
 
         {/* Top Section: Clock & Quick Actions */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -981,7 +1410,7 @@ export default function App() {
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
-                disabled={!!todayRecord.timeIn}
+                disabled={!!todayRecord.timeIn || !!todayRecord.timeOut}
                 icon={<ArrowRight size={22} />}
                 colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
               />
@@ -995,7 +1424,7 @@ export default function App() {
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
-                disabled={!todayRecord.timeIn || !!todayRecord.breakOut}
+                disabled={!todayRecord.timeIn || !!todayRecord.breakOut || !!todayRecord.timeOut}
                 icon={<Coffee size={22} />}
                 colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
               />
@@ -1009,7 +1438,7 @@ export default function App() {
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
-                disabled={!todayRecord.breakOut || !!todayRecord.breakIn}
+                disabled={!todayRecord.breakOut || !!todayRecord.breakIn || !!todayRecord.timeOut}
                 icon={<ArrowLeft size={22} />}
                 colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
               />
@@ -1023,7 +1452,7 @@ export default function App() {
                   setPunchPromptReason('');
                   setPunchPromptOpen(true);
                 }}
-                disabled={!todayRecord.breakIn && !!todayRecord.timeIn && !todayRecord.timeOut === false}
+                disabled={!todayRecord.timeIn || !!todayRecord.timeOut || (!!todayRecord.breakOut && !todayRecord.breakIn)}
                 icon={<ArrowLeft size={22} />}
                 colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
               />
@@ -1049,19 +1478,20 @@ export default function App() {
                 >Leaves & Holidays</button>
               </div>
             </div>
-            <div className="flex flex-col sm:flex-row items-center gap-4 w-full lg:w-auto">
+            <div className="flex flex-col 2xl:flex-row items-end 2xl:items-center gap-4 w-full lg:w-auto">
 
               {/* FILTER CONTROLS */}
-              <div className="flex items-center gap-3 bg-white dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-200/50 dark:border-white/[0.08] shadow-sm dark:shadow-none w-full sm:w-auto">
+              <div className="flex items-center gap-3 bg-white dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-200/50 dark:border-white/[0.08] shadow-sm dark:shadow-none w-full sm:w-auto justify-end">
                 <span className="text-sm font-semibold text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Filter:</span>
 
                 <select
                   value={filterMode}
-                  onChange={(e) => setFilterMode(e.target.value as 'range' | 'month')}
+                  onChange={(e) => setFilterMode(e.target.value as 'range' | 'month' | 'single')}
                   className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent cursor-pointer hover:text-zinc-900 dark:text-white font-medium"
                 >
                   <option value="month">By Month</option>
                   <option value="range">Date Range</option>
+                  <option value="single">Single Date</option>
                 </select>
 
                 <div className="h-4 w-px bg-zinc-300 mx-1"></div>
@@ -1071,6 +1501,13 @@ export default function App() {
                     type="month"
                     value={monthFilter}
                     onChange={e => setMonthFilter(e.target.value)}
+                    className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent"
+                  />
+                ) : filterMode === 'single' ? (
+                  <input
+                    type="date"
+                    value={singleDate}
+                    onChange={e => setSingleDate(e.target.value)}
                     className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent"
                   />
                 ) : (
@@ -1092,24 +1529,37 @@ export default function App() {
                 )}
               </div>
 
-                            <button
-                onClick={() => {
-                  setLeaveDateInput(format(new Date(currentTime.getTime() + 86400000), 'yyyy-MM-dd'));
-                  setLeaveRemarkInput('Vacation Leave');
-                  setIsLeaveModalOpen(true);
-                }}
-                className="flex items-center justify-center gap-2 bg-white dark:bg-zinc-900 border-2 border-zinc-200/50 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 px-5 py-2.5 rounded-xl font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:bg-zinc-900/50 hover:border-zinc-300 dark:border-zinc-700 hover:text-zinc-900 dark:text-white transition-all shadow-sm dark:shadow-none text-sm active:scale-95 w-full sm:w-auto shrink-0"
-              >
-                <CalendarPlus size={18} className="text-emerald-600 dark:text-emerald-400" />
-                Add Future Leave
-              </button>
-              <button
-                onClick={handleOpenPreview}
-                className="flex items-center justify-center gap-2 bg-white dark:bg-zinc-900 border-2 border-zinc-200/50 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 px-5 py-2.5 rounded-xl font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:bg-zinc-900/50 hover:border-zinc-300 dark:border-zinc-700 hover:text-zinc-900 dark:text-white transition-all shadow-sm dark:shadow-none text-sm active:scale-95 w-full sm:w-auto shrink-0"
-              >
-                <Download size={18} className="text-blue-600 dark:text-blue-400" />
-                Preview Export
-              </button>
+              <div className="flex flex-wrap items-center justify-end gap-2 w-full sm:w-auto">
+                <button
+                  onClick={handleSyncDiscord}
+                  disabled={isSyncing}
+                  className="flex items-center justify-center gap-2 bg-[#5865F2]/10 dark:bg-[#5865F2]/20 border-2 border-[#5865F2]/30 text-[#5865F2] dark:text-[#8ea1e1] px-4 py-2 rounded-xl font-bold hover:bg-[#5865F2]/20 transition-all shadow-sm text-sm active:scale-95 disabled:opacity-50 shrink-0"
+                >
+                  <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
+                  {isSyncing ? "Syncing..." : "Sync from Discord"}
+                </button>
+                <button
+                  onClick={() => {
+                    const tmrw = format(new Date(currentTime.getTime() + 86400000), 'yyyy-MM-dd');
+                    setLeaveDateInput(tmrw);
+                    setLeaveEndDateInput(tmrw);
+                    setLeaveMode('single');
+                    setLeaveRemarkInput('Vacation Leave');
+                    setIsLeaveModalOpen(true);
+                  }}
+                  className="flex items-center justify-center gap-2 bg-white dark:bg-zinc-900 border-2 border-zinc-200/50 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 px-4 py-2 rounded-xl font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:bg-zinc-900/50 hover:border-zinc-300 dark:border-zinc-700 hover:text-zinc-900 dark:text-white transition-all shadow-sm dark:shadow-none text-sm active:scale-95 shrink-0"
+                >
+                  <CalendarPlus size={16} className="text-emerald-600 dark:text-emerald-400" />
+                  Add Future Leave
+                </button>
+                <button
+                  onClick={handleOpenPreview}
+                  className="flex items-center justify-center gap-2 bg-white dark:bg-zinc-900 border-2 border-zinc-200/50 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 px-4 py-2 rounded-xl font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:bg-zinc-900/50 hover:border-zinc-300 dark:border-zinc-700 hover:text-zinc-900 dark:text-white transition-all shadow-sm dark:shadow-none text-sm active:scale-95 shrink-0"
+                >
+                  <Download size={16} className="text-blue-600 dark:text-blue-400" />
+                  Preview Export
+                </button>
+              </div>
             </div>
           </div>
 
@@ -1138,10 +1588,16 @@ export default function App() {
                   const bIn = parseTime(record.breakIn);
 
                   let officeMins = 0;
-                  if (tIn !== null && tOut !== null) officeMins = tOut - tIn;
+                  if (tIn !== null && tOut !== null) {
+                    officeMins = tOut - tIn;
+                    if (officeMins < 0) officeMins += 24 * 60; // Handle overnight shift
+                  }
 
                   let breakMins = 0;
-                  if (bOut !== null && bIn !== null) breakMins = bIn - bOut;
+                  if (bOut !== null && bIn !== null) {
+                    breakMins = bIn - bOut;
+                    if (breakMins < 0) breakMins += 24 * 60; // Handle overnight break
+                  }
 
                   const workMins = Math.max(0, officeMins - breakMins);
                   const standardMins = 8 * 60;

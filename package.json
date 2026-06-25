@@ -8,9 +8,14 @@
     "dev": "concurrently \"vite\" \"electron .\"",
     "build": "tsc && vite build",
     "electron:start": "electron .",
-    "dist": "vite build && electron-builder"
+    "dist": "vite build && electron-builder",
+    "build:android": "vite build && npx cap sync android",
+    "build:apk": "npm run build:android && cd android && gradlew assembleDebug"
   },
   "dependencies": {
+    "@capacitor/core": "^8.4.1",
+    "@capacitor/filesystem": "^8.1.2",
+    "@capacitor/share": "^8.0.1",
     "date-fns": "^3.6.0",
     "exceljs": "^4.4.0",
     "lucide-react": "^0.368.0",
@@ -18,6 +23,8 @@
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
+    "@capacitor/android": "^8.4.1",
+    "@capacitor/cli": "^8.4.1",
     "@tailwindcss/vite": "^4.3.1",
     "@types/react": "^18.2.66",
     "@types/react-dom": "^18.2.22",
