@@ -1,6 +1,6 @@
 ﻿import React, { useState, useEffect } from 'react';
 import { format } from 'date-fns';
-import { ArrowRight, ArrowLeft, Coffee, Moon, Sun, User, Settings, X, Save, AlertTriangle } from 'lucide-react';
+import { ArrowRight, ArrowLeft, Coffee, Moon, Sun, User, Settings, X, Save, AlertTriangle, Check } from 'lucide-react';
 
 const ipcRenderer = window.require ? window.require('electron').ipcRenderer : null;
 
@@ -664,12 +664,16 @@ function PunchButton({ variant, title, schedule, time, onClick, isActive, isComp
     <button
       onClick={onClick}
       disabled={isCompleted}
+      aria-label={isCompleted ? `${title} — recorded at ${formatDisplayTime(time)}` : title}
       className={`punch-tile ${PUNCH_TILE_CLASS[variant]} ${stateClass}`}
     >
-      <div className="punch-tile-icon-badge">{icon}</div>
+      <div className="punch-tile-icon-badge">
+        {isCompleted ? <Check size={22} strokeWidth={2.5} /> : icon}
+      </div>
       <span className="font-bold text-sm mb-0.5">{title}</span>
       <span className="vintage-eyebrow mb-2">Schedule {schedule}</span>
       <span className="text-lg font-extrabold tabular-nums">{formatDisplayTime(time)}</span>
+      {isCompleted && <span className="punch-tile-done-label">Recorded</span>}
     </button>
   );
 }

@@ -92,8 +92,67 @@ html.dark .vintage-page {
 }
 
 .punch-tile:disabled {
-  opacity: 0.55;
   cursor: not-allowed;
+  pointer-events: none;
+}
+
+.punch-tile-completed:disabled {
+  background: #D4D0CA;
+  color: #2A2A2A;
+  filter: grayscale(100%);
+  opacity: 1;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.12);
+  transform: none;
+}
+
+.punch-tile-completed:disabled .punch-tile-icon-badge {
+  background: rgba(255, 255, 255, 0.55);
+  color: #2A2A2A;
+}
+
+.punch-tile-completed:disabled .vintage-eyebrow {
+  color: #6B6B6B;
+}
+
+.punch-tile-completed:disabled .punch-tile-done-label {
+  background: rgba(42, 42, 42, 0.12);
+  color: #2A2A2A;
+  opacity: 1;
+}
+
+html.dark .punch-tile-completed:disabled {
+  background: #4A4A4A;
+  color: #E8E4DE;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+html.dark .punch-tile-completed:disabled .punch-tile-icon-badge {
+  background: rgba(255, 255, 255, 0.12);
+  color: #E8E4DE;
+}
+
+html.dark .punch-tile-completed:disabled .vintage-eyebrow {
+  color: #A8A4A0;
+}
+
+html.dark .punch-tile-completed:disabled .punch-tile-done-label {
+  background: rgba(255, 255, 255, 0.12);
+  color: #E8E4DE;
+}
+
+.punch-tile-done-label {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(245, 234, 217, 0.22);
+  color: inherit;
+  opacity: 0.85;
 }
 
 .punch-tile-icon-badge {
@@ -193,43 +252,21 @@ html.dark .vintage-page {
   color: rgba(245, 234, 217, 0.65);
 }
 
-/* Tile color variants — completed */
-.punch-tile-in.punch-tile-completed {
-  background: var(--color-vintage-navy);
-  color: var(--color-vintage-cream-text);
-  opacity: 0.85;
-}
-.punch-tile-in.punch-tile-completed .punch-tile-icon-badge {
-  background: rgba(245, 234, 217, 0.15);
-  color: var(--color-vintage-cream-text);
+/* Tile color variants — completed (overridden to B&W when disabled) */
+.punch-tile-completed:disabled.punch-tile-in,
+.punch-tile-completed:disabled.punch-tile-break-out,
+.punch-tile-completed:disabled.punch-tile-break-in,
+.punch-tile-completed:disabled.punch-tile-out {
+  background: #D4D0CA;
+  color: #2A2A2A;
 }
 
-.punch-tile-break-out.punch-tile-completed {
-  background: var(--color-vintage-peach);
-  color: var(--color-vintage-ink);
-}
-.punch-tile-break-out.punch-tile-completed .punch-tile-icon-badge {
-  background: rgba(43, 61, 79, 0.08);
-  color: var(--color-vintage-ink);
-}
-
-.punch-tile-break-in.punch-tile-completed {
-  background: var(--color-vintage-sage);
-  color: var(--color-vintage-forest);
-}
-.punch-tile-break-in.punch-tile-completed .punch-tile-icon-badge {
-  background: rgba(47, 92, 63, 0.12);
-  color: var(--color-vintage-forest);
-}
-
-.punch-tile-out.punch-tile-completed {
-  background: var(--color-vintage-terracotta);
-  color: var(--color-vintage-cream-text);
-  opacity: 0.85;
-}
-.punch-tile-out.punch-tile-completed .punch-tile-icon-badge {
-  background: rgba(245, 234, 217, 0.2);
-  color: var(--color-vintage-cream-text);
+html.dark .punch-tile-completed:disabled.punch-tile-in,
+html.dark .punch-tile-completed:disabled.punch-tile-break-out,
+html.dark .punch-tile-completed:disabled.punch-tile-break-in,
+html.dark .punch-tile-completed:disabled.punch-tile-out {
+  background: #4A4A4A;
+  color: #E8E4DE;
 }
 
 /* ── Utility icon buttons ── */
