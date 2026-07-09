@@ -26,15 +26,13 @@
     }
   },
   "employeeInfo": {
-    "name": "Kim Castor",
-    "position": "Tester",
-    "id": "T-1234",
+    "name": "Ivan R. Contrevida",
+    "position": "Software Engineer",
+    "id": "T-25-0069",
     "payrollPeriod": "",
-    "alarmEnabled": true,
-    "alarmHours": 8,
     "discordWebhook": "https://discordapp.com/api/webhooks/1517498509581090816/GGKte3BpK4X7SFIAvkdDU9MrebshcOYqiT4NAaM8f1gNkLbSjXKZ2piggGs4eMvKzsV3",
     "discordUsername": "kimcastor6066",
-    "theme": "dark",
+    "theme": "light",
     "workLocation": "HOME",
     "autoSyncEnabled": false
   }

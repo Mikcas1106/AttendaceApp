@@ -1,9 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+﻿import React, { useState, useEffect } from 'react';
 import { format } from 'date-fns';
-import { Upload, Trash2, CalendarPlus, Clock, Download, ArrowRight, ArrowLeft, Coffee, Briefcase, Moon, Sun, User, Calendar, Settings, X, Save, RefreshCw } from 'lucide-react';
-import { Capacitor } from '@capacitor/core';
-import { Filesystem, Directory } from '@capacitor/filesystem';
-import { Share } from '@capacitor/share';
+import { ArrowRight, ArrowLeft, Coffee, Moon, Sun, User, Settings, X, Save, AlertTriangle } from 'lucide-react';
 
 const ipcRenderer = window.require ? window.require('electron').ipcRenderer : null;
 
@@ -21,8 +18,6 @@ type EmployeeInfo = {
   position: string;
   id: string;
   payrollPeriod: string;
-  alarmEnabled?: boolean;
-  alarmHours?: number;
   discordWebhook?: string;
   discordUsername?: string;
   theme?: 'light' | 'dark' | 'system';
@@ -30,19 +25,63 @@ type EmployeeInfo = {
   autoSyncEnabled?: boolean;
 };
 
-// Helper for UI computation
-function parseTime(timeStr: string) {
-  if (!timeStr) return null;
-  const parts = timeStr.split(':');
-  return parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+type PunchType = 'timeIn' | 'breakOut' | 'breakIn' | 'timeOut';
+
+function formatDisplayTime(timeStr: string) {
+  if (!timeStr) return '--:--';
+  const [h, m] = timeStr.split(':').map(Number);
+  const period = h >= 12 ? 'PM' : 'AM';
+  const hour12 = h % 12 || 12;
+  return `${hour12}:${m.toString().padStart(2, '0')} ${period}`;
 }
 
-function formatMinutes(mins: number) {
-  if (mins <= 0) return '0:00';
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return `${h}:${m.toString().padStart(2, '0')}`;
+const PUNCH_SCHEDULES = {
+  timeIn: '9:00 AM',
+  breakOut: '12:00 PM',
+  breakIn: '1:00 PM',
+  timeOut: '6:00 PM',
+} as const;
+
+const PUNCH_LABELS: Record<PunchType, string> = {
+  timeIn: 'In',
+  breakOut: 'Break Out',
+  breakIn: 'Break In',
+  timeOut: 'Out',
+};
+
+const WORK_TARGET_SECS = 8 * 3600;
+const BREAK_LIMIT_SECS = 60 * 60;
+
+function formatDuration(secs: number) {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (h > 0 && m > 0) return `${h}h ${m}m`;
+  if (h > 0) return `${h}h`;
+  return `${m}m`;
 }
+
+function getActivePunchType(record: AttendanceRecord): PunchType | null {
+  if (!record.timeIn) return 'timeIn';
+  if (!record.breakOut && !record.timeOut) return 'breakOut';
+  if (record.breakOut && !record.breakIn && !record.timeOut) return 'breakIn';
+  if (record.timeIn && !record.timeOut && (!record.breakOut || record.breakIn)) return 'timeOut';
+  return null;
+}
+
+function normalizeTheme(theme?: EmployeeInfo['theme']): 'light' | 'dark' {
+  return theme === 'dark' ? 'dark' : 'light';
+}
+
+function withDefaultTheme(info: Partial<EmployeeInfo>): EmployeeInfo {
+  return { ...info, theme: normalizeTheme(info.theme) } as EmployeeInfo;
+}
+
+const PUNCH_TILE_CLASS: Record<PunchType, string> = {
+  timeIn: 'punch-tile-in',
+  breakOut: 'punch-tile-break-out',
+  breakIn: 'punch-tile-break-in',
+  timeOut: 'punch-tile-out',
+};
 
 export default function App() {
   const [currentTime, setCurrentTime] = useState(new Date());
@@ -53,200 +92,35 @@ export default function App() {
     position: 'Staff',
     id: '00000',
     payrollPeriod: '',
-    alarmEnabled: true,
-    alarmHours: 8,
     discordWebhook: '',
     discordUsername: 'kimcastor6066',
-    theme: 'dark',
+    theme: 'light',
     workLocation: 'HOME',
     autoSyncEnabled: false
   });
 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
   const [isDarkTheme, setIsDarkTheme] = useState(false);
   const [punchPromptOpen, setPunchPromptOpen] = useState(false);
-  const [punchPromptType, setPunchPromptType] = useState<'timeIn' | 'breakOut' | 'breakIn' | 'timeOut' | null>(null);
+  const [punchPromptType, setPunchPromptType] = useState<PunchType | null>(null);
   const [punchPromptTime, setPunchPromptTime] = useState('');
   const [punchPromptLocation, setPunchPromptLocation] = useState('');
   const [punchPromptReason, setPunchPromptReason] = useState('');
-  const [tableTab, setTableTab] = useState<'all' | 'leaves'>('all');
-  const [recordToDelete, setRecordToDelete] = useState<string | null>(null);
-  const [isLeaveModalOpen, setIsLeaveModalOpen] = useState(false);
-  const [leaveDateInput, setLeaveDateInput] = useState('');
-  const [leaveEndDateInput, setLeaveEndDateInput] = useState('');
-  const [leaveMode, setLeaveMode] = useState<'single' | 'range'>('single');
-  const [leaveRemarkInput, setLeaveRemarkInput] = useState('');
-  const [isTestMode, setIsTestMode] = useState(import.meta.env.DEV);
-  const [isAlarmRinging, setIsAlarmRinging] = useState(false);
+  const [confirmPunchType, setConfirmPunchType] = useState<PunchType | null>(null);
+  const isTestMode = false;
   const [pendingSettings, setPendingSettings] = useState<EmployeeInfo | null>(null);
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const hasAutoSynced = useRef(false);
-
-  const handleExportBackup = () => {
-    const backupData = {
-      records,
-      employeeInfo
-    };
-    const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `attendance-backup-${format(new Date(), 'yyyy-MM-dd')}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
-
-  const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      try {
-        const data = JSON.parse(event.target?.result as string);
-        if (data.records) saveRecords(data.records);
-        if (data.employeeInfo) {
-           setEmployeeInfo(data.employeeInfo);
-           if (ipcRenderer) ipcRenderer.invoke('write-settings', data.employeeInfo);
-        }
-        alert('Backup imported successfully!');
-        setIsSettingsOpen(false);
-      } catch (error) {
-        alert('Invalid backup file format.');
-      }
-    };
-    reader.readAsText(file);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
 
   useEffect(() => {
     const root = window.document.documentElement;
-    let isDark = false;
-    if (employeeInfo.theme === 'system' || !employeeInfo.theme) {
-      const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-      isDark = systemTheme === 'dark';
-    } else {
-      isDark = employeeInfo.theme === 'dark';
-    }
+    const isDark = employeeInfo.theme === 'dark';
     root.classList.toggle('dark', isDark);
     setIsDarkTheme(isDark);
   }, [employeeInfo.theme]);
-  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
-  const [isSyncPreview, setIsSyncPreview] = useState(false);
-
-  const [filterMode, setFilterMode] = useState<'range' | 'month' | 'single'>('month');
-  const [startDate, setStartDate] = useState('');
-  const [endDate, setEndDate] = useState('');
-  const [monthFilter, setMonthFilter] = useState(format(new Date(), 'yyyy-MM'));
-  const [singleDate, setSingleDate] = useState(format(new Date(), 'yyyy-MM-dd'));
-
-  const [previewRecords, setPreviewRecords] = useState<Record<string, AttendanceRecord>>({});
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
-
-  const [isSyncing, setIsSyncing] = useState(false);
-
-  const handleSyncDiscord = async () => {
-    if (!employeeInfo.discordUsername) {
-      alert('Please configure your Discord Username in Settings first.');
-      return;
-    }
-
-    setIsSyncing(true);
-    try {
-      const targetMonth = filterMode === 'month' ? monthFilter : format(new Date(), 'yyyy-MM');
-      const res = await fetch(`https://discord-scraper-attendance-system.onrender.com/api/messages?month=${targetMonth}&username=${employeeInfo.discordUsername}`);
-      
-      if (!res.ok) throw new Error(`API returned ${res.status}`);
-      
-      const responseData = await res.json();
-      const messagesArray = responseData.messages;
-      
-      if (!Array.isArray(messagesArray)) throw new Error('Invalid format returned by scraper');
-      if (messagesArray.length === 0) {
-        alert('No records found for this month/username!');
-        return;
-      }
-      
-      const newRecords = { ...records };
-      
-      // Process messages from oldest to newest to build daily records correctly
-      const sortedMessages = messagesArray.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-      
-      sortedMessages.forEach((m: any) => {
-         const content = m.content.toLowerCase();
-         
-         // Only process messages that belong to the correct name (if sent via bot)
-         if (m.viaAttendanceBot && !content.includes(employeeInfo.name.toLowerCase())) {
-            return;
-         }
-         
-         // Parse the Date from timestamp
-         const dateObj = new Date(m.timestamp);
-         const dateStr = format(dateObj, 'd-MMM-yy');
-         
-         if (!newRecords[dateStr]) {
-            newRecords[dateStr] = {
-               date: dateStr,
-               timeIn: '',
-               breakOut: '',
-               breakIn: '',
-               timeOut: '',
-               remarks: ''
-            };
-         }
-         
-         // Try to extract time from content like (08:44) or use the timestamp time
-         let timeStr = format(dateObj, 'HH:mm');
-         const timeMatch = m.content.match(/\((.*?)\)/);
-         if (timeMatch && timeMatch[1]) {
-             // Keep it simple, just extract the digits
-             const t = timeMatch[1].replace(/[^0-9:]/g, '');
-             if (t.includes(':')) {
-                 timeStr = t;
-                 // Quick am/pm fix if it was provided
-                 if (timeMatch[1].toLowerCase().includes('pm')) {
-                     const [h, min] = t.split(':');
-                     if (parseInt(h) < 12) timeStr = `${parseInt(h) + 12}:${min}`;
-                 }
-                 // Ensure HH:mm padding
-                 const parts = timeStr.split(':');
-                 timeStr = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
-             }
-         }
-         
-         if (content.includes('break out')) {
-            newRecords[dateStr].breakOut = timeStr;
-         } else if (content.includes('break in')) {
-            newRecords[dateStr].breakIn = timeStr;
-         } else if (content.includes('out')) {
-            newRecords[dateStr].timeOut = timeStr;
-         } else if (content.includes('in')) {
-            // Check if timeIn already exists so we don't overwrite it with a later 'in'
-            if (!newRecords[dateStr].timeIn) {
-               newRecords[dateStr].timeIn = timeStr;
-            }
-         }
-      });
-      
-      setPreviewRecords(newRecords);
-      setIsSyncPreview(true);
-      setIsPreviewOpen(true);
-      // alert(`Successfully synced ${Object.keys(newRecords).length} unique records from ${messagesArray.length} messages!`);
-    } catch (e: any) {
-      console.error(e);
-      alert('Failed to sync from Discord: ' + e.message);
-    } finally {
-      setIsSyncing(false);
-    }
-  };
 
   useEffect(() => {
     if (isTestMode) {
@@ -254,7 +128,7 @@ export default function App() {
         .then(res => res.json())
         .then(data => {
           if (data.records) setRecords(data.records);
-          if (data.employeeInfo) setEmployeeInfo(data.employeeInfo);
+          if (data.employeeInfo) setEmployeeInfo(withDefaultTheme(data.employeeInfo));
         })
         .catch(err => console.error("Failed to load test data", err));
       return;
@@ -268,14 +142,13 @@ export default function App() {
           setRecords({});
         }
       });
-      
+
       ipcRenderer.invoke('read-settings').then((data: EmployeeInfo) => {
         if (data && data.name) {
-          setEmployeeInfo(data);
+          setEmployeeInfo(withDefaultTheme(data));
         }
       });
     } else {
-      // APK / Browser Fallback
       const localData = localStorage.getItem('attendance_records');
       if (localData) {
         setRecords(JSON.parse(localData));
@@ -285,18 +158,16 @@ export default function App() {
 
       const localSettings = localStorage.getItem('attendance_settings');
       if (localSettings) {
-        setEmployeeInfo(JSON.parse(localSettings));
+        setEmployeeInfo(withDefaultTheme(JSON.parse(localSettings)));
       } else {
         setEmployeeInfo({
           name: '',
           position: '',
           id: '',
           payrollPeriod: '',
-          alarmEnabled: true,
-          alarmHours: 8,
           discordWebhook: '',
           discordUsername: '',
-          theme: 'dark',
+          theme: 'light',
           workLocation: 'HOME',
           autoSyncEnabled: false
         });
@@ -304,23 +175,9 @@ export default function App() {
     }
   }, [isTestMode]);
 
-  useEffect(() => {
-    if (!employeeInfo.autoSyncEnabled || !employeeInfo.discordUsername) return;
-    if (hasAutoSynced.current) return;
-    
-    hasAutoSynced.current = true;
-    setIsSyncing(true); // Show loading modal immediately
-
-    // Slight delay to ensure UI is ready before actually fetching
-    const timer = setTimeout(() => {
-      handleSyncDiscord();
-    }, 1000);
-    return () => clearTimeout(timer);
-  }, [employeeInfo.autoSyncEnabled, employeeInfo.discordUsername]);
-
   const saveRecords = (newRecords: Record<string, AttendanceRecord>) => {
     setRecords(newRecords);
-    if (isTestMode) return; // Prevent test data from overwriting the real production file
+    if (isTestMode) return;
     if (ipcRenderer) {
       ipcRenderer.invoke('write-data', newRecords);
     } else {
@@ -329,30 +186,27 @@ export default function App() {
   };
 
   const saveSettings = (newInfo: EmployeeInfo) => {
-    setEmployeeInfo(newInfo);
+    const normalized = withDefaultTheme(newInfo);
+    setEmployeeInfo(normalized);
     if (isTestMode) {
       setIsSettingsOpen(false);
       return;
     }
     if (ipcRenderer) {
-      ipcRenderer.invoke('write-settings', newInfo);
+      ipcRenderer.invoke('write-settings', normalized);
     } else {
-      localStorage.setItem('attendance_settings', JSON.stringify(newInfo));
+      localStorage.setItem('attendance_settings', JSON.stringify(normalized));
     }
     setIsSettingsOpen(false);
   };
 
-  const todayStr = format(currentTime, 'd-MMM-yy');
-
   const getTodayRecord = (): AttendanceRecord => {
     const todayStr = format(currentTime, 'd-MMM-yy');
     const yesterdayStr = format(new Date(currentTime.getTime() - 86400000), 'd-MMM-yy');
-    
+
     const todayRecordObj = records[todayStr];
     const yesterdayRecordObj = records[yesterdayStr];
 
-    // If today hasn't started yet, and yesterday's shift is still open (no timeOut),
-    // treat the "current active dashboard record" as yesterday's shift so they can Time Out.
     if (!todayRecordObj?.timeIn && yesterdayRecordObj?.timeIn && !yesterdayRecordObj?.timeOut) {
       return yesterdayRecordObj;
     }
@@ -360,7 +214,7 @@ export default function App() {
     return todayRecordObj || { date: todayStr, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
   };
 
-  const handlePunch = (type: 'timeIn' | 'breakOut' | 'breakIn' | 'timeOut', customTime: string, location: string = '', reason: string = '') => {
+  const handlePunch = (type: PunchType, customTime: string, location: string = '', reason: string = '') => {
     const timeStr = customTime || format(currentTime, 'HH:mm');
     const targetRecord = getTodayRecord();
     const newRecord = { ...targetRecord, [type]: timeStr };
@@ -370,12 +224,11 @@ export default function App() {
     const newRecords = { ...records, [targetRecord.date]: newRecord };
     saveRecords(newRecords);
 
-    // Discord Webhook Integration
     if (employeeInfo.discordWebhook) {
       const loc = location.trim() ? location.trim().toUpperCase() : (employeeInfo.workLocation || 'HOME');
       let message = '';
       const formattedReason = reason.trim() ? ` (${reason.trim().toUpperCase()})` : '';
-      
+
       if (type === 'timeIn') message = `IN @ ${loc}${formattedReason}`;
       else if (type === 'timeOut') message = `OUT @ ${loc}${formattedReason}`;
       else if (type === 'breakOut') message = `BREAK OUT @ ${loc}${formattedReason}`;
@@ -391,50 +244,52 @@ export default function App() {
     }
   };
 
-  const handlePreviewEdit = (date: string, field: keyof AttendanceRecord, value: string) => {
-    const record = previewRecords[date] || { date, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
-    setPreviewRecords({ ...previewRecords, [date]: { ...record, [field]: value } });
+  const openPunchPrompt = (type: PunchType) => {
+    setPunchPromptType(type);
+    setPunchPromptTime('');
+    setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
+    setPunchPromptReason('');
+    setPunchPromptOpen(true);
   };
 
   const todayRecord = getTodayRecord();
+  const activePunch = getActivePunchType(todayRecord);
+  const onBreak = !!todayRecord.breakOut && !todayRecord.breakIn && !todayRecord.timeOut;
 
-  const [alarmTriggered, setAlarmTriggered] = useState(false);
+  const requestPunch = (type: PunchType) => {
+    if (activePunch === type) {
+      openPunchPrompt(type);
+    } else {
+      setConfirmPunchType(type);
+    }
+  };
 
-  const computeTodayWorkMins = () => {
-    const tIn = parseTime(todayRecord.timeIn);
-    if (tIn === null) return 0;
+  const computeBreakSeconds = () => {
+    const bOutStr = todayRecord.breakOut;
+    if (!bOutStr) return 0;
 
-    let tOut = parseTime(todayRecord.timeOut);
-    if (tOut === null) {
-      tOut = parseTime(format(currentTime, 'HH:mm'));
+    const bOutDate = new Date(currentTime);
+    const [bOutH, bOutM] = bOutStr.split(':').map(Number);
+    bOutDate.setHours(bOutH, bOutM, 0, 0);
+
+    let bInDate = new Date(currentTime);
+    if (todayRecord.breakIn) {
+      const [bInH, bInM] = todayRecord.breakIn.split(':').map(Number);
+      bInDate.setHours(bInH, bInM, 0, 0);
+    } else if (todayRecord.timeOut) {
+      const [outH, outM] = todayRecord.timeOut.split(':').map(Number);
+      bInDate.setHours(outH, outM, 0, 0);
     }
 
-    let officeMins = 0;
-    if (tOut !== null) {
-      officeMins = tOut - tIn;
-      if (officeMins < 0) officeMins += 24 * 60; // Handle overnight shift
-    }
-
-    let breakMins = 0;
-    const bOut = parseTime(todayRecord.breakOut);
-    if (bOut !== null) {
-      let bIn = parseTime(todayRecord.breakIn);
-      if (bIn === null && !todayRecord.timeOut) {
-        bIn = parseTime(format(currentTime, 'HH:mm'));
-      }
-      if (bIn !== null) {
-        breakMins = bIn - bOut;
-        if (breakMins < 0) breakMins += 24 * 60; // Handle overnight break
-      }
-    }
-
-    return Math.max(0, officeMins - breakMins);
+    let breakSecs = Math.floor((bInDate.getTime() - bOutDate.getTime()) / 1000);
+    if (breakSecs < 0) breakSecs += 24 * 3600;
+    return Math.max(0, breakSecs);
   };
 
   const computeTodayWorkSeconds = () => {
     const tInStr = todayRecord.timeIn;
     if (!tInStr) return 0;
-    
+
     const tInDate = new Date(currentTime);
     const [inH, inM] = tInStr.split(':').map(Number);
     tInDate.setHours(inH, inM, 0, 0);
@@ -446,28 +301,9 @@ export default function App() {
     }
 
     let officeSecs = Math.floor((tOutDate.getTime() - tInDate.getTime()) / 1000);
-    if (officeSecs < 0) officeSecs += 24 * 3600; // Handle overnight shift
+    if (officeSecs < 0) officeSecs += 24 * 3600;
 
-    let breakSecs = 0;
-    const bOutStr = todayRecord.breakOut;
-    if (bOutStr) {
-      const bOutDate = new Date(currentTime);
-      const [bOutH, bOutM] = bOutStr.split(':').map(Number);
-      bOutDate.setHours(bOutH, bOutM, 0, 0);
-
-      let bInDate = new Date(currentTime);
-      if (todayRecord.breakIn) {
-        const [bInH, bInM] = todayRecord.breakIn.split(':').map(Number);
-        bInDate.setHours(bInH, bInM, 0, 0);
-      } else if (todayRecord.timeOut) {
-        bInDate = new Date(tOutDate);
-      }
-
-      breakSecs = Math.floor((bInDate.getTime() - bOutDate.getTime()) / 1000);
-      if (breakSecs < 0) breakSecs += 24 * 3600; // Handle overnight break
-    }
-
-    return Math.max(0, officeSecs - breakSecs);
+    return Math.max(0, officeSecs - computeBreakSeconds());
   };
 
   const computeTodayWork = () => {
@@ -479,430 +315,79 @@ export default function App() {
     return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  useEffect(() => {
-    // Request notification permission on startup
-    if (typeof Notification !== 'undefined' && Notification.permission !== "granted" && Notification.permission !== "denied") {
-      Notification.requestPermission();
-    }
-  }, []);
+  const workSecs = computeTodayWorkSeconds();
+  const breakSecs = computeBreakSeconds();
+  const workRemaining = Math.max(0, WORK_TARGET_SECS - workSecs);
+  const workOvertime = Math.max(0, workSecs - WORK_TARGET_SECS);
+  const breakRemaining = Math.max(0, BREAK_LIMIT_SECS - breakSecs);
+  const breakOvertime = Math.max(0, breakSecs - BREAK_LIMIT_SECS);
 
-  // Loop continuous audio when ringing
-  useEffect(() => {
-    let interval: any;
-    if (isAlarmRinging) {
-      try {
-        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const playBeep = () => {
-          const osc = audioCtx.createOscillator();
-          const gain = audioCtx.createGain();
-          osc.connect(gain);
-          gain.connect(audioCtx.destination);
-          osc.type = 'square';
-          osc.frequency.setValueAtTime(800, audioCtx.currentTime);
-          osc.frequency.setValueAtTime(1200, audioCtx.currentTime + 0.1);
-          
-          gain.gain.setValueAtTime(0, audioCtx.currentTime);
-          gain.gain.linearRampToValueAtTime(0.5, audioCtx.currentTime + 0.05);
-          gain.gain.setValueAtTime(0.5, audioCtx.currentTime + 0.2);
-          gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
-          
-          osc.start(audioCtx.currentTime);
-          osc.stop(audioCtx.currentTime + 0.3);
-        };
-        playBeep();
-        interval = setInterval(playBeep, 600);
-      } catch (e) {
-        console.error("Audio beep failed", e);
-      }
-    }
-    return () => clearInterval(interval);
-  }, [isAlarmRinging]);
-
-  useEffect(() => {
-    if (employeeInfo.alarmEnabled === false) {
-      setAlarmTriggered(false);
-      setIsAlarmRinging(false);
-      return;
-    }
-
-    const workSecs = computeTodayWorkSeconds();
-    const targetSecs = (employeeInfo.alarmHours || 8) * 3600;
-    
-    // Check if target hours is reached
-    if (workSecs >= targetSecs && workSecs > 0 && !alarmTriggered && !todayRecord.timeOut) {
-      setIsAlarmRinging(true);
-      setAlarmTriggered(true);
-
-      if (typeof Notification !== 'undefined' && Notification.permission === "granted") {
-        new Notification("Shift Complete! 🎉", {
-          body: `You have reached exactly ${employeeInfo.alarmHours || 8} hours of work today. Don't forget to Time Out!`
-        });
-      }
-    } else if (alarmTriggered && (workSecs < targetSecs || todayRecord.timeOut)) {
-      setAlarmTriggered(false);
-      setIsAlarmRinging(false);
-    }
-  }, [currentTime, todayRecord, alarmTriggered, employeeInfo.alarmEnabled, employeeInfo.alarmHours]);
-
-  const PH_HOLIDAYS: Record<string, string> = {
-    '01-01': "New Year's Day",
-    '02-25': "EDSA Revolution Anniversary",
-    '04-09': "Araw ng Kagitingan",
-    '05-01': "Labor Day",
-    '06-12': "Independence Day",
-    '08-21': "Ninoy Aquino Day",
-    '08-31': "National Heroes Day",
-    '11-01': "All Saints' Day",
-    '11-30': "Bonifacio Day",
-    '12-08': "Immaculate Conception",
-    '12-25': "Christmas Day",
-    '12-30': "Rizal Day",
-    '12-31': "New Year's Eve"
-  };
-
-  const MOVABLE_HOLIDAYS_2026: Record<string, string> = {
-    '2026-04-02': "Maundy Thursday",
-    '2026-04-03': "Good Friday"
-  };
-
-  const getHoliday = (date: Date): string => {
-    const monthDay = format(date, 'MM-dd');
-    if (PH_HOLIDAYS[monthDay]) return PH_HOLIDAYS[monthDay];
-    
-    const fullDate = format(date, 'yyyy-MM-dd');
-    if (MOVABLE_HOLIDAYS_2026[fullDate]) return MOVABLE_HOLIDAYS_2026[fullDate];
-
-    return '';
-  };
-
-  // Used for filtering the preview specifically
-  const getFilteredList = (sourceRecords: Record<string, AttendanceRecord>) => {
-    let targetDays: Date[] = [];
-    
-    if (filterMode === 'month') {
-      if (monthFilter) {
-        const [year, month] = monthFilter.split('-');
-        
-        // Generate all days in this month
-        const daysInMonth = new Date(parseInt(year), parseInt(month), 0).getDate();
-        for (let i = 1; i <= daysInMonth; i++) {
-          targetDays.push(new Date(parseInt(year), parseInt(month) - 1, i));
-        }
-      }
-    } else if (filterMode === 'range') {
-      if (startDate && endDate) {
-        const s = new Date(startDate);
-        const e = new Date(endDate);
-        for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
-          targetDays.push(new Date(d));
-        }
-      }
-    } else if (filterMode === 'single') {
-      if (singleDate) {
-        targetDays.push(new Date(singleDate));
-      }
-    }
-
-    // Fallback: if no valid range is generated, just use the dates that exist in the records
-    if (targetDays.length === 0) {
-      targetDays = Object.values(sourceRecords).map(r => new Date(r.date));
-    }
-
-    // Deduplicate and map
-    const uniqueMap = new Map<string, AttendanceRecord>();
-    
-    targetDays.forEach(d => {
-      const isWeekend = d.getDay() === 0 || d.getDay() === 6;
-      const dateStr = format(d, 'd-MMM-yy');
-      const existing = sourceRecords[dateStr];
-      
-      let remarks = existing?.remarks || '';
-      
-      // Auto-detect holiday if remarks are empty
-      if (!remarks) {
-        const holiday = getHoliday(d);
-        if (holiday) remarks = holiday;
-      }
-
-      // Show missing dates as well to provide a complete view
-      if (!existing) {
-        uniqueMap.set(dateStr, {
-          date: dateStr,
-          timeIn: '',
-          breakOut: '',
-          breakIn: '',
-          timeOut: '',
-          remarks: isWeekend && !remarks ? 'Weekend' : remarks
-        });
-      } else {
-        uniqueMap.set(dateStr, existing);
-      }
-    });
-
-    return Array.from(uniqueMap.values())
-      .sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  };
-
-  const filteredRecordsList = getFilteredList(records);
-  const filteredPreviewList = getFilteredList(previewRecords);
-  
-  const recordsToDisplay = filteredRecordsList.filter(r => {
-    if (tableTab === 'all') return true;
-    return r.remarks && (r.remarks.toLowerCase().includes('leave') || r.remarks.toLowerCase().includes('holiday') || getHoliday(new Date(r.date)));
-  });
-
-  const handleOpenPreview = () => {
-    setPreviewRecords(records);
-    setIsSyncPreview(false);
-    setIsPreviewOpen(true);
-  };
-
-  const handleConfirmExport = () => {
-    // Save any changes made in preview back to the main DB
-    saveRecords(previewRecords);
-
-    if (ipcRenderer) {
-      const filteredDict: Record<string, AttendanceRecord> = {};
-      filteredPreviewList.forEach(r => filteredDict[r.date] = r);
-      
-      let computedPeriod = "All Records";
-      
-      if (filterMode === 'month' && monthFilter) {
-        const [year, month] = monthFilter.split('-');
-        computedPeriod = format(new Date(parseInt(year), parseInt(month) - 1, 1), 'MMMM yyyy');
-      } else if (filterMode === 'range') {
-        if (startDate && endDate) {
-          computedPeriod = `${format(new Date(startDate), 'MMMM d, yyyy')} to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
-        } else if (startDate) {
-          computedPeriod = `From ${format(new Date(startDate), 'MMMM d, yyyy')}`;
-        } else if (endDate) {
-          computedPeriod = `Up to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
-        }
-      }
-
-      const infoToExport = { ...employeeInfo, payrollPeriod: computedPeriod };
-      ipcRenderer.invoke('export-excel', filteredDict, infoToExport);
-    } else {
-      // Browser / APK Fallback for Excel Export
-      exportExcelWeb(filteredDict, { ...employeeInfo, payrollPeriod: computedPeriod });
-    }
-    setIsPreviewOpen(false);
-  };
-
-  const exportExcelWeb = async (recordsData: Record<string, AttendanceRecord>, info: EmployeeInfo) => {
-    try {
-      // Dynamically import to avoid breaking Capacitor/Vite on initial load
-      const ExcelJS = (await import('exceljs')).default;
-      const workbook = new ExcelJS.Workbook();
-      const sheet = workbook.addWorksheet('Timesheet');
-
-      sheet.getColumn('A').width = 15;
-      sheet.getColumn('B').width = 15;
-      sheet.getColumn('C').width = 15;
-      sheet.getColumn('D').width = 15;
-      sheet.getColumn('E').width = 15;
-      sheet.getColumn('F').width = 15;
-      sheet.getColumn('G').width = 15;
-      sheet.getColumn('H').width = 15;
-      sheet.getColumn('I').width = 30;
-
-      sheet.addRow(['EMPLOYEE NAME:', info.name]);
-      sheet.addRow(['POSITION:', info.position]);
-      sheet.addRow(['ID NUMBER:', info.id]);
-      sheet.addRow(['PAYROLL PERIOD:', info.payrollPeriod]);
-      sheet.addRow([]);
-
-      sheet.addRow([
-        'Date', 'Time In', 'Break Out', 'Break In', 'Time Out',
-        'Total Work Hours', 'Total Overtime', 'Undertime', 'Remarks'
-      ]).font = { bold: true };
-
-      const recordsList = Object.values(recordsData).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-
-      let totalWorkMinsSum = 0;
-      let totalOTMinsSum = 0;
-      let totalUTMinsSum = 0;
-
-      recordsList.forEach(r => {
-        let work = 0;
-        let ut = 0;
-        let ot = 0;
-
-        const tIn = parseTime(r.timeIn);
-        const tOut = parseTime(r.timeOut);
-        if (tIn !== null && tOut !== null) {
-          let mins = tOut - tIn;
-          const bOut = parseTime(r.breakOut);
-          const bIn = parseTime(r.breakIn);
-          if (bOut !== null && bIn !== null) {
-             const breakDuration = bIn - bOut;
-             if (breakDuration > 0) mins -= breakDuration;
-          }
-          if (mins < 0) mins = 0;
-
-          work = mins;
-          const REQUIRED_MINS = 8 * 60;
-          if (work < REQUIRED_MINS) {
-            ut = REQUIRED_MINS - work;
-          } else if (work > REQUIRED_MINS) {
-            ot = work - REQUIRED_MINS;
-          }
-        }
-
-        totalWorkMinsSum += work;
-        totalUTMinsSum += ut;
-        totalOTMinsSum += ot;
-
-        sheet.addRow([
-          r.date, r.timeIn, r.breakOut, r.breakIn, r.timeOut,
-          formatMinutes(work), formatMinutes(ot), formatMinutes(ut), r.remarks
-        ]);
-      });
-
-      sheet.addRow([]);
-      sheet.addRow(['TOTALS', '', '', '', '', formatMinutes(totalWorkMinsSum), formatMinutes(totalOTMinsSum), formatMinutes(totalUTMinsSum), '']).font = { bold: true };
-
-      const buffer = await workbook.xlsx.writeBuffer();
-      const fileName = `Attendance_${info.name.replace(/\s+/g, '_')}_${info.payrollPeriod.replace(/[\\/:*?"<>|]/g, '')}.xlsx`;
-
-      if (Capacitor.isNativePlatform()) {
-        const bytes = new Uint8Array(buffer as ArrayBuffer);
-        let binary = '';
-        const len = bytes.byteLength;
-        for (let i = 0; i < len; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        const base64Str = window.btoa(binary);
-
-        const savedFile = await Filesystem.writeFile({
-          path: fileName,
-          data: base64Str,
-          directory: Directory.Cache,
-        });
-
-        await Share.share({
-          title: fileName,
-          url: savedFile.uri,
-        });
-      } else {
-        const blob = new Blob([buffer as ArrayBuffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
-      }
-
-    } catch (error: any) {
-      console.error('Failed to export Excel natively in browser', error);
-      alert('Failed to generate Excel file: ' + (error?.message || error));
-    }
-  };
-
-  const handleConfirmSync = () => {
-    saveRecords(previewRecords);
-    setIsPreviewOpen(false);
-    setIsSyncPreview(false);
-    alert('Sync successfully applied to your dashboard!');
+  const toggleTheme = () => {
+    const newTheme = isDarkTheme ? 'light' : 'dark';
+    saveSettings({ ...employeeInfo, theme: newTheme });
   };
 
   return (
-    <div className="min-h-screen relative text-zinc-800 dark:text-zinc-200 font-sans selection:bg-blue-100 selection:text-blue-900">
-      <div className="liquid-bg"></div>
-      {/* Top Navbar */}
-      <header className="bg-white/60 dark:bg-black/40 backdrop-blur-3xl border-b border-zinc-200/50 dark:border-white/5 px-4 md:px-8 py-3 md:py-4 flex justify-between items-center sticky top-0 z-10 shadow-sm">
-        <div className="flex items-center gap-2 md:gap-3">
-          <div className="rounded-xl md:rounded-2xl shadow-md dark:shadow-none shadow-blue-200 overflow-hidden bg-white dark:bg-zinc-900 border border-zinc-200/50 dark:border-zinc-800 flex items-center justify-center w-10 h-10 md:w-14 md:h-14 shrink-0">
-            <img src="./icon.png" alt="ClockedIn Logo" className="w-full h-full object-cover scale-[1.15]" />
-          </div>
-          <div>
-            <h1 className="text-lg md:text-2xl font-bold text-zinc-900 dark:text-white leading-tight tracking-tight">ClockedIn</h1>
-            <p className="hidden sm:block text-[10px] md:text-xs text-zinc-500 dark:text-zinc-400 font-semibold tracking-wide uppercase mt-0.5">Time & Attendance</p>
-          </div>
-        </div>
+    <div className="vintage-page min-h-screen text-[#2A3B4C] dark:text-[#F5EAD9] font-sans selection:bg-[#F3D2B5] selection:text-[#2A3B4C] safe-bottom">
 
-        <div className="flex items-center gap-3 md:gap-6">
-          <div className="hidden sm:flex flex-col items-end">
-            <span className="text-sm font-bold text-zinc-900 dark:text-white">{employeeInfo.name || 'User'}</span>
-            <span className="text-xs text-zinc-500 dark:text-zinc-400 font-medium">{employeeInfo.position || 'Employee'} {employeeInfo.id ? `• ID: ${employeeInfo.id}` : ''}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => {
-                const newTheme = isDarkTheme ? 'light' : 'dark';
-                saveSettings({ ...employeeInfo, theme: newTheme });
-              }}
-              className="w-9 h-9 md:w-10 md:h-10 bg-zinc-100 dark:bg-zinc-800/50 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-full flex items-center justify-center border border-zinc-200/50 dark:border-white/[0.08] text-zinc-600 dark:text-zinc-400 transition-colors shadow-sm dark:shadow-none cursor-pointer"
-              title={isDarkTheme ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-            >
-              {isDarkTheme ? <Sun size={18} /> : <Moon size={18} />}
-            </button>
-            <button
-              onClick={() => setIsSettingsOpen(true)}
-              className="w-9 h-9 md:w-10 md:h-10 bg-zinc-100 dark:bg-zinc-800/50 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-full flex items-center justify-center border border-zinc-200/50 dark:border-white/[0.08] text-zinc-600 dark:text-zinc-400 transition-colors shadow-sm dark:shadow-none cursor-pointer"
-              title="Edit Information"
-            >
-              <User size={18} />
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* Universal Punch Modal */}
+      {/* Punch Modal */}
       {punchPromptOpen && punchPromptType && (
-        <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm overflow-hidden p-6 animate-in fade-in zoom-in-95 duration-200">
-            <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Confirm Punch Time</h3>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">Adjust the time if you forgot to punch earlier.</p>
-            
-            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Time</label>
-            <input 
+        <div className="vintage-modal-overlay">
+          <div className="vintage-modal p-6 animate-in fade-in zoom-in-95 duration-200">
+            <p className="vintage-eyebrow mb-1">Confirm Punch</p>
+            <h3 className="vintage-modal-title text-xl mb-1">Adjust Time</h3>
+            <p className="text-sm vintage-muted-text mb-5">Set the time if you forgot to punch earlier.</p>
+
+            <label className="vintage-eyebrow block mb-1.5">Time</label>
+            <input
               autoFocus={punchPromptType !== 'breakOut'}
-              type="time" 
+              type="time"
               value={punchPromptTime}
               onChange={e => setPunchPromptTime(e.target.value)}
-              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
+              className="vintage-input mb-4 font-mono"
             />
 
-                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Location</label>
-                <input 
-                  type="text" 
-                  value={punchPromptLocation}
-                  onChange={e => setPunchPromptLocation(e.target.value)}
-                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm"
-                  placeholder="e.g. HOME, TRANCO OFFICE"
-                />
+            <label className="vintage-eyebrow block mb-1.5">Location</label>
+            <input
+              type="text"
+              value={punchPromptLocation}
+              onChange={e => setPunchPromptLocation(e.target.value)}
+              className="vintage-input mb-4"
+              placeholder="e.g. HOME, TRANCO OFFICE"
+            />
 
-                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Reason (Optional)</label>
-                <textarea 
-                  rows={1}
-                  autoFocus={punchPromptType === 'breakOut'}
-                  value={punchPromptReason}
-                  onChange={e => {
-                    setPunchPromptReason(e.target.value);
-                    e.target.style.height = 'auto';
-                    e.target.style.height = `${e.target.scrollHeight}px`;
-                  }}
-                  onKeyDown={e => {
-                     if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
-                        setPunchPromptOpen(false);
-                     }
-                  }}
-                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm resize-none overflow-hidden"
-                  placeholder="e.g. LUNCH, BROWNOUT"
-                />
+            <label className="vintage-eyebrow block mb-1.5">Reason (Optional)</label>
+            <textarea
+              rows={1}
+              autoFocus={punchPromptType === 'breakOut'}
+              value={punchPromptReason}
+              onChange={e => {
+                setPunchPromptReason(e.target.value);
+                e.target.style.height = 'auto';
+                e.target.style.height = `${e.target.scrollHeight}px`;
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
+                  setPunchPromptOpen(false);
+                }
+              }}
+              className="vintage-input mb-6 resize-none overflow-hidden"
+              placeholder="e.g. LUNCH, BROWNOUT"
+            />
 
-            <div className="flex justify-end gap-3 mt-2">
-              <button onClick={() => setPunchPromptOpen(false)} className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
-              <button onClick={() => {
-                handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
-                setPunchPromptOpen(false);
-              }} className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl transition-colors font-medium text-sm shadow-sm">Confirm Punch</button>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setPunchPromptOpen(false)} className="vintage-btn-ghost">Cancel</button>
+              <button
+                onClick={() => {
+                  handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
+                  setPunchPromptOpen(false);
+                }}
+                className="vintage-btn-primary"
+              >
+                Confirm Punch
+              </button>
             </div>
           </div>
         </div>
@@ -910,788 +395,280 @@ export default function App() {
 
       {/* Settings Modal */}
       {isSettingsOpen && (
-        <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl shadow-xl dark:shadow-2xl dark:shadow-black/50 w-full max-w-4xl max-h-[90dvh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-800/30 shrink-0">
-              <h3 className="font-bold text-lg flex items-center gap-2"><Settings size={18} className="text-blue-600 dark:text-blue-400" /> Settings & Preferences</h3>
-              <button onClick={() => setIsSettingsOpen(false)} className="text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:text-zinc-400 dark:text-zinc-500"><X size={20} /></button>
+        <div className="vintage-modal-overlay">
+          <div className="vintage-modal max-h-[90dvh] flex flex-col animate-in fade-in zoom-in-95 duration-200">
+            <div className="vintage-modal-header">
+              <div>
+                <p className="vintage-eyebrow mb-0.5">Preferences</p>
+                <h3 className="vintage-modal-title text-lg flex items-center gap-2">
+                  <Settings size={18} className="text-[#D97A44]" /> Settings
+                </h3>
+              </div>
+              <button onClick={() => setIsSettingsOpen(false)} className="vintage-icon-btn w-9 h-9">
+                <X size={16} />
+              </button>
             </div>
-            <form onSubmit={(e) => {
-              e.preventDefault();
-              const formData = new FormData(e.currentTarget);
-              setPendingSettings({
-                name: formData.get('name') as string,
-                position: formData.get('position') as string,
-                id: formData.get('id') as string,
-                payrollPeriod: '', // We don't save this anymore, it's computed dynamically
-                alarmEnabled: formData.get('alarmEnabled') === 'on',
-                alarmHours: Number(formData.get('alarmHours')) || 8,
-                discordWebhook: formData.get('discordWebhook') as string,
-                discordUsername: formData.get('discordUsername') as string,
-                autoSyncEnabled: formData.get('autoSyncEnabled') === 'on',
-                theme: employeeInfo.theme,
-                workLocation: (formData.get('workLocation') as string) || 'HOME',
-              });
-            }} className="p-6 overflow-y-auto flex-1">
-              
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                {/* Left Column: Personal Info */}
-                <div className="flex flex-col gap-4">
-                  <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><User size={16} className="text-blue-500 dark:text-blue-400"/> Personal Details</h4>
-                  
-                  <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Full Name <span className="text-red-500">*</span></label>
-                    <input name="name" defaultValue={employeeInfo.name} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Position <span className="text-red-500">*</span></label>
-                    <input name="position" defaultValue={employeeInfo.position} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Employee ID No. <span className="text-red-500">*</span></label>
-                    <input name="id" defaultValue={employeeInfo.id} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Default Work Location <span className="text-red-500">*</span></label>
-                    <input name="workLocation" defaultValue={employeeInfo.workLocation?.trim() || 'HOME'} placeholder="HOME" required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                setPendingSettings({
+                  name: formData.get('name') as string,
+                  position: formData.get('position') as string,
+                  id: formData.get('id') as string,
+                  payrollPeriod: '',
+                  discordWebhook: formData.get('discordWebhook') as string,
+                  theme: employeeInfo.theme,
+                  workLocation: (formData.get('workLocation') as string) || 'HOME',
+                });
+              }}
+              className="flex flex-col flex-1 min-h-0"
+            >
+              <div className="vintage-settings-scroll flex flex-col gap-6">
+                <div>
+                  <h4 className="vintage-section-title">
+                    <User size={15} className="text-[#D97A44]" /> Personal Details
+                  </h4>
+                  <div className="flex flex-col gap-4">
+                    <div>
+                      <label className="vintage-label">Full Name <span className="text-[#D97A44]">*</span></label>
+                      <input name="name" defaultValue={employeeInfo.name} required className="vintage-input" />
+                    </div>
+                    <div>
+                      <label className="vintage-label">Position <span className="text-[#D97A44]">*</span></label>
+                      <input name="position" defaultValue={employeeInfo.position} required className="vintage-input" />
+                    </div>
+                    <div>
+                      <label className="vintage-label">Employee ID No. <span className="text-[#D97A44]">*</span></label>
+                      <input name="id" defaultValue={employeeInfo.id} required className="vintage-input" />
+                    </div>
+                    <div>
+                      <label className="vintage-label">Default Work Location <span className="text-[#D97A44]">*</span></label>
+                      <input name="workLocation" defaultValue={employeeInfo.workLocation?.trim() || 'HOME'} placeholder="HOME" required className="vintage-input" />
+                    </div>
                   </div>
                 </div>
 
-                {/* Right Column: Integrations & Alarms */}
-                <div className="flex flex-col gap-6">
-                  
-                  {/* Alarm Settings */}
-                  <div className="flex flex-col gap-4">
-                    <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><Clock size={16} className="text-blue-500 dark:text-blue-400"/> Alarm Settings</h4>
-                    
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300">Enable Shift Alarm</label>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Play a sound and notification when shift is complete.</p>
-                      </div>
-                      <label className="relative inline-flex items-center cursor-pointer">
-                        <input type="checkbox" name="alarmEnabled" defaultChecked={employeeInfo.alarmEnabled !== false} className="sr-only peer" />
-                        <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-700 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                      </label>
-                    </div>
-
-                    <div>
-                      <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Target Work Hours</label>
-                      <input type="number" name="alarmHours" min="0" max="24" step="any" defaultValue={employeeInfo.alarmHours || 8} className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
-                    </div>
+                <div>
+                  <h4 className="vintage-section-title">Discord Integration</h4>
+                  <div>
+                    <label className="vintage-label">Discord Webhook URL</label>
+                    <input name="discordWebhook" type="url" defaultValue={employeeInfo.discordWebhook} placeholder="https://discord.com/api/webhooks/..." className="vintage-input text-sm" />
+                    <p className="text-xs vintage-muted-text mt-2">Punches will be sent to your Discord channel.</p>
                   </div>
-
-                  {/* Discord */}
-                  <div className="flex flex-col gap-4">
-                    <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2">💬 Discord Integration</h4>
-                    <div>
-                      <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Discord Webhook URL <span className="text-red-500">*</span></label>
-                      <input name="discordWebhook" type="url" required defaultValue={employeeInfo.discordWebhook} placeholder="https://discord.com/api/webhooks/..." className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm" />
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">Punches (Time In, Time Out, etc.) will be automatically sent to your Discord channel.</p>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Discord Username (For Syncing) <span className="text-red-500">*</span></label>
-                      <input name="discordUsername" type="text" required defaultValue={employeeInfo.discordUsername} placeholder="e.g. kimcastor6066" className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 font-mono text-sm" />
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">Used to pull past records from the Discord Scraper API.</p>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300">Auto Sync on Startup</label>
-                        <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Automatically sync from Discord every time you open the app.</p>
-                      </div>
-                      <label className="relative inline-flex items-center cursor-pointer">
-                        <input type="checkbox" name="autoSyncEnabled" defaultChecked={employeeInfo.autoSyncEnabled === true} className="sr-only peer" />
-                        <div className="w-11 h-6 bg-zinc-200 dark:bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-zinc-300 dark:after:border-zinc-700 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                      </label>
-                    </div>
-                  </div>
-
                 </div>
               </div>
 
-              <div className="mt-8 pt-4 border-t border-zinc-100 dark:border-zinc-800 flex flex-col gap-4">
-                
-                {/* Backup & Import */}
-                <div className="flex flex-col sm:flex-row gap-3 border border-zinc-200/50 dark:border-zinc-800 p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900/50 justify-between items-center">
-                  <div className="text-sm">
-                    <p className="font-bold text-zinc-800 dark:text-zinc-200">Data Management</p>
-                    <p className="text-xs text-zinc-500 dark:text-zinc-400">Backup your data as a JSON file, or restore from a previous backup.</p>
-                  </div>
-                  <div className="flex gap-2 w-full sm:w-auto">
-                    <button 
-                      type="button" 
-                      onClick={handleExportBackup}
-                      className="flex-1 sm:flex-none justify-center flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors shadow-sm"
-                    >
-                      <Download size={14} /> Backup Data
-                    </button>
-                    
-                    <button 
-                      type="button" 
-                      onClick={() => fileInputRef.current?.click()}
-                      className="flex-1 sm:flex-none justify-center flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors shadow-sm"
-                    >
-                      <Upload size={14} /> Import JSON
-                    </button>
-                    <input 
-                      type="file" 
-                      accept=".json" 
-                      ref={fileInputRef} 
-                      onChange={handleImportBackup} 
-                      className="hidden" 
-                    />
-                  </div>
-                </div>
-
-                {/* Footer Buttons */}
-                <div className="flex justify-between items-center">
-                  <button 
-                    type="button" 
-                    onClick={() => setIsResetConfirmOpen(true)}
-                    className="text-red-500 hover:text-red-600 dark:text-red-400 dark:hover:text-red-300 font-medium px-4 py-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors text-sm"
-                  >
-                    Reset Database
-                  </button>
-                  <button type="submit" className="bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-2.5 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors">
-                    <Save size={18} /> Save Details
-                  </button>
-                </div>
+              <div className="px-6 pb-6 pt-4 flex justify-end shrink-0">
+                <button type="submit" className="vintage-btn-primary flex items-center gap-2">
+                  <Save size={16} /> Save Details
+                </button>
               </div>
             </form>
           </div>
         </div>
       )}
 
+      {/* Out-of-Sequence Punch Confirm Modal */}
+      {confirmPunchType && (
+        <div className="vintage-modal-overlay z-[60]">
+          <div className="vintage-modal p-6 text-center animate-in zoom-in-95 duration-200">
+            <div className="w-12 h-12 bg-[#F3D2B5] text-[#D97A44] rounded-full flex items-center justify-center mx-auto mb-4">
+              <AlertTriangle size={22} />
+            </div>
+            <h3 className="vintage-modal-title text-lg mb-2">Out of Sequence</h3>
+            <p className="vintage-muted-text text-sm mb-6">
+              You&apos;re about to record <strong>{PUNCH_LABELS[confirmPunchType]}</strong>, but it&apos;s not the expected next step. Continue?
+            </p>
+            <div className="flex gap-3 justify-center">
+              <button onClick={() => setConfirmPunchType(null)} className="vintage-btn-ghost">Cancel</button>
+              <button
+                onClick={() => {
+                  openPunchPrompt(confirmPunchType);
+                  setConfirmPunchType(null);
+                }}
+                className="vintage-btn-primary"
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Settings Confirm Modal */}
       {pendingSettings && (
-        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-xl w-full max-w-sm overflow-hidden animate-in zoom-in-95 duration-200 border border-zinc-200 dark:border-zinc-800">
-            <div className="p-6 text-center">
-              <div className="w-12 h-12 bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Save size={24} />
-              </div>
-              <h3 className="font-bold text-lg text-zinc-900 dark:text-zinc-100 mb-2">Save Details?</h3>
-              <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-6">Are you sure you want to save these changes to your settings and preferences?</p>
-              <div className="flex gap-3 justify-center">
-                <button 
-                  onClick={() => setPendingSettings(null)}
-                  className="px-4 py-2 font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-xl transition-colors"
-                >
-                  Cancel
-                </button>
-                <button 
-                  onClick={() => {
-                    if (pendingSettings) {
-                      saveSettings(pendingSettings);
-                      setPendingSettings(null);
-                    }
-                  }}
-                  className="px-6 py-2 font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors shadow-sm"
-                >
-                  Confirm Save
-                </button>
-              </div>
+        <div className="vintage-modal-overlay z-[60]">
+          <div className="vintage-modal p-6 text-center animate-in zoom-in-95 duration-200">
+            <div className="w-12 h-12 bg-[#F3D2B5] text-[#D97A44] rounded-full flex items-center justify-center mx-auto mb-4">
+              <Save size={22} />
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* Syncing Loading Modal */}
-      {isSyncing && (
-        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-md z-[100] flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/80 backdrop-blur-3xl rounded-3xl shadow-2xl border border-blue-500/30 w-full max-w-sm overflow-hidden p-8 text-center animate-in fade-in duration-200">
-            <div className="w-16 h-16 bg-blue-100 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center mx-auto mb-6">
-              <RefreshCw size={32} className="animate-spin" />
-            </div>
-            <h3 className="font-bold text-xl text-zinc-900 dark:text-white mb-2">Syncing with Discord...</h3>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Please wait while we fetch your latest attendance records. This may take a few moments.</p>
-          </div>
-        </div>
-      )}
-
-      {/* Alarm Ringing Modal */}
-      {isAlarmRinging && (
-        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-md z-[100] flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/80 backdrop-blur-3xl rounded-3xl shadow-2xl border border-red-500/50 w-full max-w-sm overflow-hidden p-8 animate-pulse text-center">
-            <div className="w-20 h-20 bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 rounded-full flex items-center justify-center mx-auto mb-6">
-              <Clock size={40} className="animate-bounce" />
-            </div>
-            <h3 className="font-black text-2xl text-red-600 dark:text-red-400 mb-2 uppercase tracking-widest">Shift Complete!</h3>
-            <p className="text-zinc-600 dark:text-zinc-400 mb-8 font-medium">You have reached your target of {employeeInfo.alarmHours || 8} hours.</p>
-            
-            <button onClick={() => setIsAlarmRinging(false)} className="w-full py-4 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-colors font-black text-lg shadow-lg shadow-red-600/30 tracking-widest uppercase">
-              Stop Alarm
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Reset Confirmation Modal */}
-      {isResetConfirmOpen && (
-        <div className="fixed inset-0 bg-zinc-900/60 backdrop-blur-md z-[60] flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/80 backdrop-blur-3xl rounded-3xl shadow-2xl border border-red-500/20 dark:border-red-500/10 w-full max-w-sm overflow-hidden p-6 animate-in fade-in zoom-in-95 duration-200">
-            <h3 className="font-bold text-lg text-red-600 dark:text-red-400 mb-2">Delete All Data?</h3>
-            <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-6">Are you absolutely sure you want to wipe the database? This action cannot be undone and you will lose all attendance history.</p>
-            
-            <div className="flex justify-end gap-3">
-              <button onClick={() => setIsResetConfirmOpen(false)} className="px-4 py-2 rounded-xl text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
-              <button onClick={() => {
-                saveRecords({});
-                setIsResetConfirmOpen(false);
-                setIsSettingsOpen(false);
-              }} className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-colors font-bold text-sm shadow-sm shadow-red-600/20">Yes, Wipe Database</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-
-
-      {/* Delete Confirmation Modal */}
-      {recordToDelete && (
-        <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm overflow-hidden p-6 animate-in fade-in zoom-in-95 duration-200">
-            <div className="w-12 h-12 bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400 rounded-full flex items-center justify-center mb-4">
-              <Trash2 size={24} />
-            </div>
-            <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Delete Record?</h3>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">Are you sure you want to permanently delete the attendance record for <strong>{recordToDelete}</strong>?</p>
-            <div className="flex justify-end gap-3">
-              <button 
-                onClick={() => setRecordToDelete(null)}
-                className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm"
+            <h3 className="vintage-modal-title text-lg mb-2">Save Details?</h3>
+            <p className="vintage-muted-text text-sm mb-6">Are you sure you want to save these changes?</p>
+            <div className="flex gap-3 justify-center">
+              <button onClick={() => setPendingSettings(null)} className="vintage-btn-ghost">Cancel</button>
+              <button
+                onClick={() => {
+                  if (pendingSettings) {
+                    saveSettings(pendingSettings);
+                    setPendingSettings(null);
+                  }
+                }}
+                className="vintage-btn-primary"
               >
-                Cancel
-              </button>
-              <button 
-                onClick={() => {
-                  if (recordToDelete) {
-                    const newRecords = { ...records };
-                    delete newRecords[recordToDelete];
-                    saveRecords(newRecords);
-                    setRecordToDelete(null);
-                  }
-                }}
-                className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-colors font-bold text-sm shadow-sm"
-              >
-                Yes, Delete
+                Confirm Save
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Future Leave Modal */}
-      {isLeaveModalOpen && (
-        <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm max-h-[90dvh] flex flex-col overflow-y-auto p-6 animate-in fade-in zoom-in-95 duration-200">
-            <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Add Future Leave</h3>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">Mark a future date as Leave, Absent, or Holiday.</p>
-            
-            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date Mode</label>
-            <select
-              value={leaveMode}
-              onChange={e => setLeaveMode(e.target.value as 'single' | 'range')}
-              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-medium"
-            >
-              <option value="single">Single Date</option>
-              <option value="range">Date Range</option>
-            </select>
-
-            {leaveMode === 'single' ? (
-              <>
-                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date</label>
-                <input 
-                  type="date" 
-                  value={leaveDateInput}
-                  onChange={e => setLeaveDateInput(e.target.value)}
-                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
-                />
-              </>
-            ) : (
-              <div className="flex gap-4 mb-4">
-                <div className="flex-1">
-                  <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Start Date</label>
-                  <input 
-                    type="date" 
-                    value={leaveDateInput}
-                    onChange={e => setLeaveDateInput(e.target.value)}
-                    className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 text-sm font-mono"
-                  />
-                </div>
-                <div className="flex-1">
-                  <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">End Date</label>
-                  <input 
-                    type="date" 
-                    value={leaveEndDateInput}
-                    onChange={e => setLeaveEndDateInput(e.target.value)}
-                    className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 text-sm font-mono"
-                  />
-                </div>
-              </div>
-            )}
-
-            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Leave Type / Remark</label>
-            <textarea 
-              rows={1}
-              value={leaveRemarkInput}
-              onChange={e => {
-                setLeaveRemarkInput(e.target.value);
-                e.target.style.height = 'auto';
-                e.target.style.height = `${e.target.scrollHeight}px`;
-              }}
-              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm resize-none overflow-hidden"
-              placeholder="e.g. Vacation Leave, Sick Leave"
-            />
-
-            <div className="flex justify-end gap-3 mt-2">
-              <button onClick={() => setIsLeaveModalOpen(false)} className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
-              <button onClick={() => {
-                const newRecords = { ...records };
-                if (leaveMode === 'single') {
-                  if (!leaveDateInput) return;
-                  const dateKey = format(new Date(leaveDateInput), 'd-MMM-yy');
-                  if (!newRecords[dateKey]) {
-                    newRecords[dateKey] = {
-                      date: dateKey,
-                      timeIn: '', timeOut: '', breakOut: '', breakIn: '',
-                      remarks: leaveRemarkInput
-                    };
-                  } else {
-                    newRecords[dateKey].remarks = leaveRemarkInput;
-                  }
-                } else {
-                  if (!leaveDateInput || !leaveEndDateInput) return;
-                  const s = new Date(leaveDateInput);
-                  const e = new Date(leaveEndDateInput);
-                  for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
-                    const dateKey = format(d, 'd-MMM-yy');
-                    if (!newRecords[dateKey]) {
-                      newRecords[dateKey] = {
-                        date: dateKey,
-                        timeIn: '', timeOut: '', breakOut: '', breakIn: '',
-                        remarks: leaveRemarkInput
-                      };
-                    } else {
-                      newRecords[dateKey].remarks = leaveRemarkInput;
-                    }
-                  }
-                }
-                saveRecords(newRecords);
-                setIsLeaveModalOpen(false);
-              }} className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl transition-colors font-bold text-sm shadow-sm">Save Leave</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Preview & Edit Modal */}
-      {isPreviewOpen && (
-        <div className="fixed inset-0 bg-zinc-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl shadow-xl dark:shadow-2xl dark:shadow-black/50 w-full max-w-5xl max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex justify-between items-center bg-zinc-50/50 dark:bg-zinc-800/30 shrink-0">
-              <div>
-                <h3 className="font-bold text-lg text-zinc-900 dark:text-white">
-                  {isSyncPreview ? "Preview Scraped Data" : "Preview & Edit Data"}
-                </h3>
-                <p className="text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
-                  {isSyncPreview 
-                    ? "Review the scraped attendance records before applying them to your dashboard." 
-                    : "Make any final adjustments before generating the Excel file."}
-                </p>
-              </div>
-              <button onClick={() => setIsPreviewOpen(false)} className="text-zinc-400 dark:text-zinc-500 hover:text-zinc-600 dark:text-zinc-400 dark:text-zinc-500"><X size={20} /></button>
-            </div>
-
-            <div className="flex-1 overflow-auto p-6">
-              <table className="w-full text-left border-collapse min-w-max">
-                <thead>
-                  <tr className="bg-zinc-100 dark:bg-[#1f2937]/50 border-b border-zinc-200/50 dark:border-white/5 text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 text-xs uppercase tracking-wider">
-                    <th className="py-3 px-4 font-bold">Date</th>
-                    <th className="py-3 px-4 font-bold">Time In</th>
-                    <th className="py-3 px-4 font-bold">Break Out</th>
-                    <th className="py-3 px-4 font-bold">Break In</th>
-                    <th className="py-3 px-4 font-bold">Time Out</th>
-                    <th className="py-3 px-4 font-bold">Remarks</th>
-                    <th className="py-3 px-4 font-bold text-center">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="text-sm text-zinc-700 dark:text-zinc-300">
-                  {filteredPreviewList.map(record => (
-                    <tr key={record.date} className="border-b border-zinc-100 dark:border-white/5 hover:bg-zinc-50 dark:hover:bg-white/5 dark:bg-transparent transition-colors">
-                      <td className="py-3 px-4 font-semibold text-zinc-900 dark:text-white whitespace-nowrap">{record.date}</td>
-                      <td className="py-2 px-4">
-                        <input type="time" value={record.timeIn} onChange={(e) => handlePreviewEdit(record.date, 'timeIn', e.target.value)} className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] rounded px-2 py-1 outline-none bg-transparent focus:border-blue-500 font-mono text-sm" />
-                      </td>
-                      <td className="py-2 px-4">
-                        <input type="time" value={record.breakOut} onChange={(e) => handlePreviewEdit(record.date, 'breakOut', e.target.value)} className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] rounded px-2 py-1 outline-none bg-transparent focus:border-blue-500 font-mono text-sm" />
-                      </td>
-                      <td className="py-2 px-4">
-                        <input type="time" value={record.breakIn} onChange={(e) => handlePreviewEdit(record.date, 'breakIn', e.target.value)} className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] rounded px-2 py-1 outline-none bg-transparent focus:border-blue-500 font-mono text-sm" />
-                      </td>
-                      <td className="py-2 px-4">
-                        <input type="time" value={record.timeOut} onChange={(e) => handlePreviewEdit(record.date, 'timeOut', e.target.value)} className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] rounded px-2 py-1 outline-none bg-transparent focus:border-blue-500 font-mono text-sm" />
-                      </td>
-                      <td className="py-2 px-4">
-                        <input type="text" value={record.remarks} onChange={(e) => handlePreviewEdit(record.date, 'remarks', e.target.value)} className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] rounded px-2 py-1 outline-none bg-transparent focus:border-blue-500 text-sm" placeholder="Add remark..." />
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredPreviewList.length === 0 && (
-                    <tr>
-                      <td colSpan={7} className="py-8 text-center text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">No records to preview in this range.</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="px-6 py-4 border-t border-zinc-100 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/50 flex justify-end gap-3 shrink-0">
-              <button onClick={() => setIsPreviewOpen(false)} className="px-5 py-2 rounded-lg font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-700 transition-colors">
-                Cancel
-              </button>
-              
-              {isSyncPreview ? (
-                <button onClick={handleConfirmSync} className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors active:scale-95" disabled={filteredPreviewList.length === 0}>
-                  <RefreshCw size={18} />
-                  Confirm & Apply Sync
-                </button>
-              ) : (
-                <button onClick={handleConfirmExport} className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-6 py-2 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors active:scale-95" disabled={filteredPreviewList.length === 0}>
-                  <Download size={18} />
-                  Confirm & Export
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      <main className="max-w-7xl mx-auto px-4 md:px-8 py-6 md:py-8 flex flex-col gap-6 md:gap-8">
-
-        {/* Top Section: Clock & Quick Actions */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-
-          {/* Clock Card */}
-          <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl border border-zinc-200/50 dark:border-white/[0.08] p-8 flex flex-col justify-center items-center relative overflow-hidden transition-colors">
-            
-            <div className="flex items-center gap-2 text-blue-600 dark:text-blue-400 mb-3">
-              <Calendar size={18} />
-              <span className="font-semibold text-sm">{format(currentTime, 'EEEE, MMMM do, yyyy')}</span>
-            </div>
-            <div className="text-5xl lg:text-6xl font-light text-zinc-900 dark:text-white tracking-tight tabular-nums drop-shadow-sm dark:shadow-none">
-              {format(currentTime, 'HH:mm:ss')}
-            </div>
-            <p className="text-zinc-400 dark:text-zinc-500 mt-3 text-xs font-bold uppercase tracking-[0.2em]">Current Time</p>
-          </div>
-
-          {/* Punch Actions */}
-          <div className="lg:col-span-2 bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl border border-zinc-200/50 dark:border-white/[0.08] shadow-sm dark:shadow-none p-8 flex flex-col justify-center hover:border-zinc-300 dark:border-zinc-700 transition-colors">
-            <div className="flex justify-between items-center mb-6">
-              <h2 className="text-lg font-bold text-zinc-900 dark:text-white flex items-center gap-2">
-                <Clock size={20} className="text-zinc-400 dark:text-zinc-500" />
-                Daily Attendance Terminal
-              </h2>
-              
-              <div className="bg-blue-50 dark:bg-blue-950/50 border border-blue-100 dark:border-blue-900/50 px-4 py-2 rounded-xl flex flex-col items-end shadow-sm dark:shadow-none">
-                <span className="text-[10px] uppercase font-bold text-blue-500 dark:text-blue-400 tracking-wider">Total Work Today</span>
-                <span className="text-xl font-bold font-mono text-blue-700 dark:text-blue-400">{computeTodayWork()}</span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <PunchButton
-                title="Time In"
-                time={todayRecord.timeIn}
-                onClick={() => {
-                  setPunchPromptType('timeIn');
-                  setPunchPromptTime('');
-                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
-                  setPunchPromptReason('');
-                  setPunchPromptOpen(true);
-                }}
-                disabled={!!todayRecord.timeIn || !!todayRecord.timeOut}
-                icon={<ArrowRight size={22} />}
-                colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
-              />
-              <PunchButton
-                title="Break Out"
-                time={todayRecord.breakOut}
-                onClick={() => {
-                  setPunchPromptType('breakOut');
-                  setPunchPromptTime('');
-                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
-                  setPunchPromptReason('');
-                  setPunchPromptOpen(true);
-                }}
-                disabled={!todayRecord.timeIn || !!todayRecord.breakOut || !!todayRecord.timeOut}
-                icon={<Coffee size={22} />}
-                colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
-              />
-              <PunchButton
-                title="Break In"
-                time={todayRecord.breakIn}
-                onClick={() => {
-                  setPunchPromptType('breakIn');
-                  setPunchPromptTime('');
-                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
-                  setPunchPromptReason('');
-                  setPunchPromptOpen(true);
-                }}
-                disabled={!todayRecord.breakOut || !!todayRecord.breakIn || !!todayRecord.timeOut}
-                icon={<ArrowLeft size={22} />}
-                colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
-              />
-              <PunchButton
-                title="Time Out"
-                time={todayRecord.timeOut}
-                onClick={() => {
-                  setPunchPromptType('timeOut');
-                  setPunchPromptTime('');
-                  setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
-                  setPunchPromptReason('');
-                  setPunchPromptOpen(true);
-                }}
-                disabled={!todayRecord.timeIn || !!todayRecord.timeOut || (!!todayRecord.breakOut && !todayRecord.breakIn)}
-                icon={<ArrowLeft size={22} />}
-                colorClass="text-zinc-900 dark:text-white bg-white dark:bg-[#111] border-zinc-200/50 dark:border-white/10 hover:bg-zinc-50 dark:hover:bg-[#1a1a1a]"
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* Data Table Section */}
-        <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl border border-zinc-200/50 dark:border-white/[0.08] shadow-sm dark:shadow-none overflow-hidden flex flex-col mb-12">
-          <div className="p-6 border-b border-zinc-200/50 dark:border-zinc-800 flex flex-col lg:flex-row justify-between items-start lg:items-center bg-zinc-50/50 dark:bg-zinc-800/30 gap-4">
+      {/* Main content */}
+      <main className="w-full min-h-screen flex flex-col gap-6 px-5 pt-8 pb-4 md:max-w-sm md:mx-auto">
+          {/* Header */}
+          <div className="flex justify-between items-start">
             <div>
-              <h2 className="text-lg font-bold text-zinc-900 dark:text-white">Attendance Log & Computations</h2>
-              <p className="text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1 font-medium">Review your daily records and computed hours</p>
-              
-              <div className="flex items-center gap-1 mt-4 bg-zinc-200/50 dark:bg-zinc-900 p-1 rounded-xl w-fit">
-                <button 
-                  onClick={() => setTableTab('all')}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-bold transition-all ${tableTab === 'all' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}
-                >All Records</button>
-                <button 
-                  onClick={() => setTableTab('leaves')}
-                  className={`px-4 py-1.5 rounded-lg text-sm font-bold transition-all ${tableTab === 'leaves' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}
-                >Leaves & Holidays</button>
-              </div>
+              <p className="vintage-eyebrow">{format(currentTime, 'EEEE, MMM d')}</p>
+              <h1 className="text-[2.75rem] leading-none font-extrabold text-[#2A3B4C] dark:text-[#F5EAD9] tracking-tight mt-1 tabular-nums">
+                {format(currentTime, 'h:mm a')}
+              </h1>
+              <p className="text-sm text-[#8A7F72] mt-2 font-medium">
+                {employeeInfo.name || 'Set your name'} · {employeeInfo.position || 'Staff'}
+              </p>
             </div>
-            <div className="flex flex-col 2xl:flex-row items-end 2xl:items-center gap-4 w-full lg:w-auto">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={toggleTheme}
+                className="vintage-icon-btn"
+                title={isDarkTheme ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              >
+                {isDarkTheme ? <Sun size={18} /> : <Moon size={18} />}
+              </button>
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                className="vintage-icon-btn"
+                title="Settings"
+              >
+                <Settings size={18} />
+              </button>
+            </div>
+          </div>
 
-              {/* FILTER CONTROLS */}
-              <div className="flex items-center gap-3 bg-white dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-200/50 dark:border-white/[0.08] shadow-sm dark:shadow-none w-full sm:w-auto justify-end">
-                <span className="text-sm font-semibold text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">Filter:</span>
+          {/* Section label */}
+          <div>
+            <p className="vintage-eyebrow mb-1">Today's Focus</p>
+            <h2 className="text-2xl font-bold text-[#2A3B4C] dark:text-[#F5EAD9] tracking-tight">Time Clock</h2>
+          </div>
 
-                <select
-                  value={filterMode}
-                  onChange={(e) => setFilterMode(e.target.value as 'range' | 'month' | 'single')}
-                  className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent cursor-pointer hover:text-zinc-900 dark:text-white font-medium"
-                >
-                  <option value="month">By Month</option>
-                  <option value="range">Date Range</option>
-                  <option value="single">Single Date</option>
-                </select>
-
-                <div className="h-4 w-px bg-zinc-300 mx-1"></div>
-
-                {filterMode === 'month' ? (
-                  <input
-                    type="month"
-                    value={monthFilter}
-                    onChange={e => setMonthFilter(e.target.value)}
-                    className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent"
-                  />
-                ) : filterMode === 'single' ? (
-                  <input
-                    type="date"
-                    value={singleDate}
-                    onChange={e => setSingleDate(e.target.value)}
-                    className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent"
-                  />
+          {/* Work Today stat */}
+          {todayRecord.timeIn && (
+            <div className="vintage-stat-strip flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="vintage-eyebrow">Total Work Today</span>
+                <span className="text-2xl font-extrabold font-mono text-[#F5EAD9] tabular-nums">{computeTodayWork()}</span>
+              </div>
+              <div className="border-t border-[#F5EAD9]/15 pt-2 flex flex-col gap-1">
+                {workSecs < WORK_TARGET_SECS ? (
+                  <p className="text-sm font-semibold text-red-600 tabular-nums">
+                    {formatDuration(workRemaining)} left to reach 8h
+                  </p>
                 ) : (
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="date"
-                      value={startDate}
-                      onChange={e => setStartDate(e.target.value)}
-                      className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent"
-                    />
-                    <span className="text-zinc-400 dark:text-zinc-500">to</span>
-                    <input
-                      type="date"
-                      value={endDate}
-                      onChange={e => setEndDate(e.target.value)}
-                      className="text-sm outline-none bg-transparent text-zinc-700 dark:text-zinc-300 bg-transparent"
-                    />
-                  </div>
+                  <p className="text-sm font-semibold text-[#2F5C3F] tabular-nums">
+                    8h reached (+{formatDuration(workOvertime)})
+                  </p>
                 )}
-              </div>
-
-              <div className="flex flex-wrap items-center justify-end gap-2 w-full sm:w-auto">
-                <button
-                  onClick={handleSyncDiscord}
-                  disabled={isSyncing}
-                  className="flex items-center justify-center gap-2 bg-[#5865F2]/10 dark:bg-[#5865F2]/20 border-2 border-[#5865F2]/30 text-[#5865F2] dark:text-[#8ea1e1] px-4 py-2 rounded-xl font-bold hover:bg-[#5865F2]/20 transition-all shadow-sm text-sm active:scale-95 disabled:opacity-50 shrink-0"
-                >
-                  <RefreshCw size={16} className={isSyncing ? "animate-spin" : ""} />
-                  {isSyncing ? "Syncing..." : "Sync from Discord"}
-                </button>
-                <button
-                  onClick={() => {
-                    const tmrw = format(new Date(currentTime.getTime() + 86400000), 'yyyy-MM-dd');
-                    setLeaveDateInput(tmrw);
-                    setLeaveEndDateInput(tmrw);
-                    setLeaveMode('single');
-                    setLeaveRemarkInput('Vacation Leave');
-                    setIsLeaveModalOpen(true);
-                  }}
-                  className="flex items-center justify-center gap-2 bg-white dark:bg-zinc-900 border-2 border-zinc-200/50 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 px-4 py-2 rounded-xl font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:bg-zinc-900/50 hover:border-zinc-300 dark:border-zinc-700 hover:text-zinc-900 dark:text-white transition-all shadow-sm dark:shadow-none text-sm active:scale-95 shrink-0"
-                >
-                  <CalendarPlus size={16} className="text-emerald-600 dark:text-emerald-400" />
-                  Add Future Leave
-                </button>
-                <button
-                  onClick={handleOpenPreview}
-                  className="flex items-center justify-center gap-2 bg-white dark:bg-zinc-900 border-2 border-zinc-200/50 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 px-4 py-2 rounded-xl font-bold hover:bg-zinc-50 dark:hover:bg-zinc-800 dark:bg-zinc-900/50 hover:border-zinc-300 dark:border-zinc-700 hover:text-zinc-900 dark:text-white transition-all shadow-sm dark:shadow-none text-sm active:scale-95 shrink-0"
-                >
-                  <Download size={16} className="text-blue-600 dark:text-blue-400" />
-                  Preview Export
-                </button>
+                {onBreak && (
+                  breakSecs < BREAK_LIMIT_SECS ? (
+                    <p className="text-sm font-semibold text-[#D97A44] tabular-nums">
+                      Break: {formatDuration(breakRemaining)} left
+                    </p>
+                  ) : (
+                    <p className="text-sm font-semibold text-red-600 tabular-nums">
+                      Break over by {formatDuration(breakOvertime)}
+                    </p>
+                  )
+                )}
               </div>
             </div>
+          )}
+
+          {/* Punch grid */}
+          <div className="grid grid-cols-2 gap-3 flex-1 content-start">
+            <PunchButton
+              variant="timeIn"
+              title="In"
+              schedule={PUNCH_SCHEDULES.timeIn}
+              time={todayRecord.timeIn}
+              onClick={() => requestPunch('timeIn')}
+              isActive={activePunch === 'timeIn'}
+              isCompleted={!!todayRecord.timeIn}
+              icon={<ArrowRight size={22} strokeWidth={2.5} />}
+            />
+            <PunchButton
+              variant="breakOut"
+              title="Break Out"
+              schedule={PUNCH_SCHEDULES.breakOut}
+              time={todayRecord.breakOut}
+              onClick={() => requestPunch('breakOut')}
+              isActive={activePunch === 'breakOut'}
+              isCompleted={!!todayRecord.breakOut}
+              icon={<Coffee size={22} strokeWidth={2.5} />}
+            />
+            <PunchButton
+              variant="breakIn"
+              title="Break In"
+              schedule={PUNCH_SCHEDULES.breakIn}
+              time={todayRecord.breakIn}
+              onClick={() => requestPunch('breakIn')}
+              isActive={activePunch === 'breakIn'}
+              isCompleted={!!todayRecord.breakIn}
+              icon={<ArrowLeft size={22} strokeWidth={2.5} />}
+            />
+            <PunchButton
+              variant="timeOut"
+              title="Out"
+              schedule={PUNCH_SCHEDULES.timeOut}
+              time={todayRecord.timeOut}
+              onClick={() => requestPunch('timeOut')}
+              isActive={activePunch === 'timeOut'}
+              isCompleted={!!todayRecord.timeOut}
+              icon={<ArrowLeft size={22} strokeWidth={2.5} />}
+            />
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse min-w-max">
-              <thead>
-                <tr className="bg-zinc-100 dark:bg-[#1f2937]/50 border-b border-zinc-200/50 dark:border-white/5 text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 text-xs uppercase tracking-wider">
-                  <th className="py-4 px-6 font-bold">Date</th>
-                  <th className="py-4 px-6 font-bold text-center">Time In</th>
-                  <th className="py-4 px-6 font-bold text-center">Break Out</th>
-                  <th className="py-4 px-6 font-bold text-center">Break In</th>
-                  <th className="py-4 px-6 font-bold text-center">Time Out</th>
-                  <th className="py-4 px-6 font-bold text-center bg-blue-50 dark:bg-blue-900/10">Total Work</th>
-                  <th className="py-4 px-6 font-bold text-center bg-amber-50/30 dark:bg-amber-900/10">Total OT</th>
-                  <th className="py-4 px-6 font-bold text-center bg-rose-50/30 dark:bg-rose-900/10">Undertime</th>
-                  <th className="py-4 px-6 font-bold w-64">Remarks</th>
-                </tr>
-              </thead>
-              <tbody className="text-sm text-zinc-700 dark:text-zinc-300">
-                {recordsToDisplay.map(record => {
-
-                  // Compute for UI
-                  const tIn = parseTime(record.timeIn);
-                  const tOut = parseTime(record.timeOut);
-                  const bOut = parseTime(record.breakOut);
-                  const bIn = parseTime(record.breakIn);
-
-                  let officeMins = 0;
-                  if (tIn !== null && tOut !== null) {
-                    officeMins = tOut - tIn;
-                    if (officeMins < 0) officeMins += 24 * 60; // Handle overnight shift
-                  }
-
-                  let breakMins = 0;
-                  if (bOut !== null && bIn !== null) {
-                    breakMins = bIn - bOut;
-                    if (breakMins < 0) breakMins += 24 * 60; // Handle overnight break
-                  }
-
-                  const workMins = Math.max(0, officeMins - breakMins);
-                  const standardMins = 8 * 60;
-                  let utMins = 0;
-                  let otMins = 0;
-                  if (workMins > 0) {
-                    if (workMins < standardMins) utMins = standardMins - workMins;
-                    else if (workMins > standardMins) otMins = workMins - standardMins;
-                  }
-
-                  const showComputations = tIn !== null && tOut !== null;
-
-                  return (
-                    <tr key={record.date} className="border-b border-zinc-100 dark:border-white/5 hover:bg-zinc-50 dark:hover:bg-white/5 dark:bg-transparent transition-colors group">
-                      <td className="py-4 px-6 font-semibold text-zinc-900 dark:text-white whitespace-nowrap">{record.date}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.timeIn || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.breakOut || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.breakIn || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.timeOut || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-
-                      <td className="py-4 px-6 text-center font-mono font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/10">
-                        {showComputations ? formatMinutes(workMins) : <span className="text-zinc-300 dark:text-zinc-700">—</span>}
-                      </td>
-                      <td className="py-4 px-6 text-center font-mono font-bold text-amber-700 dark:text-amber-400 bg-amber-50/10 dark:bg-amber-900/10">
-                        {showComputations ? formatMinutes(otMins) : <span className="text-zinc-300 dark:text-zinc-700">—</span>}
-                      </td>
-                      <td className="py-4 px-6 text-center font-mono font-bold text-rose-700 dark:text-rose-400 bg-rose-50/10 dark:bg-rose-900/10">
-                        {showComputations ? formatMinutes(utMins) : <span className="text-zinc-300 dark:text-zinc-700">—</span>}
-                      </td>
-
-                      <td className="py-4 px-6">
-                        <div className="flex items-center gap-2">
-                          <div className="relative flex-1">
-                            <textarea
-                              rows={1}
-                              value={record.remarks}
-                              onChange={(e) => {
-                                handleRemarkChange(record.date, e.target.value);
-                                e.target.style.height = 'auto';
-                                e.target.style.height = `${e.target.scrollHeight}px`;
-                              }}
-                              placeholder="Add remark..."
-                              className="w-full bg-zinc-50 dark:bg-zinc-900/50 border border-zinc-200/50 dark:border-white/[0.08] hover:border-zinc-300 dark:border-zinc-700 focus:bg-white dark:bg-zinc-900 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 rounded-lg px-3 py-2 outline-none bg-transparent transition-all placeholder:text-zinc-400 dark:text-zinc-500 text-sm font-medium resize-none overflow-hidden leading-tight block"
-                            />
-                          </div>
-                          <button
-                            onClick={() => setRecordToDelete(record.date)}
-                            className="p-2 text-zinc-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors cursor-pointer shrink-0"
-                            title="Delete Record"
-                          >
-                            <Trash2 size={16} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                })}
-                {Object.keys(records).length === 0 && (
-                  <tr>
-                    <td colSpan={9} className="py-16 text-center text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
-                      <div className="flex flex-col items-center justify-center gap-3">
-                        <div className="w-16 h-16 bg-zinc-100 dark:bg-zinc-800/50 rounded-full flex items-center justify-center text-zinc-300 mb-2">
-                          <Calendar size={32} />
-                        </div>
-                        <p className="font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500">No attendance records found.</p>
-                        <p className="text-xs text-zinc-400 dark:text-zinc-500">Punch in above to create your first record.</p>
-                      </div>
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <footer className="mt-auto py-4 text-center text-[10px] font-semibold tracking-wide text-[#8A7F72] uppercase">
+        Developed by <span className="text-[#2A3B4C] dark:text-[#F5EAD9] normal-case font-bold">Kim Castor</span> and Fork by <span className="text-[#2A3B4C] dark:text-[#F5EAD9] normal-case font-bold">VannyCon</span>
+        </footer>
       </main>
-
-      {/* App Footer */}
-      <footer className="mt-12 mb-8 text-center text-xs font-medium text-zinc-400 dark:text-zinc-600">
-        ClockedIn v1.0.0 • Developed by <strong>Kim Castor</strong>
-      </footer>
     </div>
   );
 }
 
-function PunchButton({ title, time, onClick, disabled, icon, colorClass }: any) {
+function PunchButton({ variant, title, schedule, time, onClick, isActive, isCompleted, icon }: {
+  variant: PunchType;
+  title: string;
+  schedule: string;
+  time: string;
+  onClick: () => void;
+  isActive: boolean;
+  isCompleted: boolean;
+  icon: React.ReactNode;
+}) {
+  const stateClass = isActive
+    ? 'punch-tile-active'
+    : isCompleted
+      ? 'punch-tile-completed'
+      : 'punch-tile-muted';
+
   return (
     <button
       onClick={onClick}
-      disabled={disabled}
-      className={`relative flex flex-col items-center justify-center p-5 rounded-xl border-2 transition-all duration-200 ${disabled ? 'opacity-50 bg-zinc-50 border-zinc-100 text-zinc-400 cursor-not-allowed grayscale-[0.5]' : `${colorClass} shadow-sm active:scale-[0.97] cursor-pointer hover:shadow-md`}`}
+      className={`punch-tile ${PUNCH_TILE_CLASS[variant]} ${stateClass}`}
     >
-      <div className="mb-3 opacity-90">{icon}</div>
-      <span className="font-bold text-sm mb-1 tracking-wide">{title}</span>
-      <span className="text-xs font-mono font-bold opacity-75">{time || '--:--'}</span>
+      <div className="punch-tile-icon-badge">{icon}</div>
+      <span className="font-bold text-sm mb-0.5">{title}</span>
+      <span className="vintage-eyebrow mb-2">Schedule {schedule}</span>
+      <span className="text-lg font-extrabold tabular-nums">{formatDisplayTime(time)}</span>
     </button>
   );
 }
