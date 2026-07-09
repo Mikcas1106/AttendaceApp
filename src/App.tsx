@@ -663,6 +663,7 @@ function PunchButton({ variant, title, schedule, time, onClick, isActive, isComp
   return (
     <button
       onClick={onClick}
+      disabled={isCompleted}
       className={`punch-tile ${PUNCH_TILE_CLASS[variant]} ${stateClass}`}
     >
       <div className="punch-tile-icon-badge">{icon}</div>
