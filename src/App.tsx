@@ -246,7 +246,7 @@ export default function App() {
 
   const openPunchPrompt = (type: PunchType) => {
     setPunchPromptType(type);
-    setPunchPromptTime('');
+    setPunchPromptTime(format(new Date(), 'HH:mm'));
     setPunchPromptLocation(employeeInfo.workLocation || 'HOME');
     setPunchPromptReason('');
     setPunchPromptOpen(true);

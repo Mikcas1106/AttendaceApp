@@ -2,8 +2,8 @@ import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
   appId: 'com.attendance.maker',
-  appName: 'clockedin',
-  webDir: 'dist'
+  appName: 'TLCI - Tracker',
+  webDir: 'public'
 };
 
 export default config;

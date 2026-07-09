@@ -1,0 +1,39 @@
+{
+  "records": {
+    "15-Jun-26": {
+      "date": "15-Jun-26",
+      "timeIn": "08:00",
+      "breakOut": "12:00",
+      "breakIn": "13:00",
+      "timeOut": "17:00",
+      "remarks": ""
+    },
+    "16-Jun-26": {
+      "date": "16-Jun-26",
+      "timeIn": "08:15",
+      "breakOut": "12:00",
+      "breakIn": "13:00",
+      "timeOut": "17:30",
+      "remarks": "Late due to traffic"
+    },
+    "17-Jun-26": {
+      "date": "17-Jun-26",
+      "timeIn": "09:00",
+      "breakOut": "12:00",
+      "breakIn": "13:00",
+      "timeOut": "18:00",
+      "remarks": ""
+    }
+  },
+  "employeeInfo": {
+    "name": "Ivan R. Contrevida",
+    "position": "Software Engineer",
+    "id": "T-25-0069",
+    "payrollPeriod": "",
+    "discordWebhook": "https://discordapp.com/api/webhooks/1517498509581090816/GGKte3BpK4X7SFIAvkdDU9MrebshcOYqiT4NAaM8f1gNkLbSjXKZ2piggGs4eMvKzsV3",
+    "discordUsername": "kimcastor6066",
+    "theme": "light",
+    "workLocation": "HOME",
+    "autoSyncEnabled": false
+  }
+}

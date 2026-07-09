@@ -10,7 +10,9 @@
     "electron:start": "electron .",
     "dist": "vite build && electron-builder",
     "build:android": "vite build && npx cap sync android",
-    "build:apk": "npm run build:android && cd android && gradlew assembleDebug"
+    "build:apk": "npm run build:android && cd android && .\\gradlew.bat assembleDebug",
+    "generate:icons": "copy public\\icon.jpg assets\\icon.png && npx capacitor-assets generate --android --iconBackgroundColor \"#F5F0E6\"",
+    "deploy": "npm run build && firebase deploy"
   },
   "dependencies": {
     "@capacitor/core": "^8.4.1",
@@ -24,6 +26,7 @@
   },
   "devDependencies": {
     "@capacitor/android": "^8.4.1",
+    "@capacitor/assets": "^3.0.5",
     "@capacitor/cli": "^8.4.1",
     "@tailwindcss/vite": "^4.3.1",
     "@types/react": "^18.2.66",
@@ -42,7 +45,7 @@
     "appId": "com.attendance.maker",
     "win": {
       "target": "nsis",
-      "icon": "public/icon.png"
+      "icon": "static/icon.png"
     },
     "directories": {
       "output": "release"
