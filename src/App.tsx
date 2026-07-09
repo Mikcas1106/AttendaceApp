@@ -555,10 +555,10 @@ export default function App() {
           </div>
 
           {/* Section label */}
-          <div>
+          {/* <div>
             <p className="vintage-eyebrow mb-1">Today's Focus</p>
             <h2 className="text-2xl font-bold text-[#2A3B4C] dark:text-[#F5EAD9] tracking-tight">Time Clock</h2>
-          </div>
+          </div> */}
 
           {/* Work Today stat */}
           {todayRecord.timeIn && (
