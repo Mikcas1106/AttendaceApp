@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { format } from 'date-fns';
-import { Upload, Trash2, CalendarPlus, Clock, Download, ArrowRight, ArrowLeft, Coffee, Briefcase, Moon, Sun, User, Calendar, Settings, X, Save, RefreshCw } from 'lucide-react';
+import { Upload, Trash2, CalendarPlus, Clock, Download, ArrowRight, ArrowLeft, Coffee, Moon, Sun, User, Calendar, Settings, X, Save, RefreshCw, Users, CheckCircle2 } from 'lucide-react';
 import { Capacitor } from '@capacitor/core';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
@@ -25,6 +25,7 @@ type EmployeeInfo = {
   alarmHours?: number;
   discordWebhook?: string;
   discordUsername?: string;
+  discordScraperUrl?: string;
   theme?: 'light' | 'dark' | 'system';
   workLocation?: string;
   autoSyncEnabled?: boolean;
@@ -57,6 +58,7 @@ export default function App() {
     alarmHours: 8,
     discordWebhook: '',
     discordUsername: 'kimcastor6066',
+    discordScraperUrl: 'https://discord-scraper-attendance-system.vercel.app',
     theme: 'dark',
     workLocation: 'HOME',
     autoSyncEnabled: false
@@ -77,9 +79,14 @@ export default function App() {
   const [leaveEndDateInput, setLeaveEndDateInput] = useState('');
   const [leaveMode, setLeaveMode] = useState<'single' | 'range'>('single');
   const [leaveRemarkInput, setLeaveRemarkInput] = useState('');
-  const [isTestMode, setIsTestMode] = useState(import.meta.env.DEV);
+  const isTestMode = Boolean(import.meta.env.DEV);
   const [isAlarmRinging, setIsAlarmRinging] = useState(false);
   const [pendingSettings, setPendingSettings] = useState<EmployeeInfo | null>(null);
+
+  // Scraper member discovery state
+  const [discoveredMembers, setDiscoveredMembers] = useState<Array<{ username: string; globalName?: string; tag?: string }>>([]);
+  const [isFetchingMembers, setIsFetchingMembers] = useState(false);
+  const [scraperStatusMessage, setScraperStatusMessage] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const hasAutoSynced = useRef(false);
@@ -110,8 +117,8 @@ export default function App() {
         const data = JSON.parse(event.target?.result as string);
         if (data.records) saveRecords(data.records);
         if (data.employeeInfo) {
-           setEmployeeInfo(data.employeeInfo);
-           if (ipcRenderer) ipcRenderer.invoke('write-settings', data.employeeInfo);
+          setEmployeeInfo(data.employeeInfo);
+          if (ipcRenderer) ipcRenderer.invoke('write-settings', data.employeeInfo);
         }
         alert('Backup imported successfully!');
         setIsSettingsOpen(false);
@@ -153,6 +160,33 @@ export default function App() {
 
   const [isSyncing, setIsSyncing] = useState(false);
 
+  const fetchDiscoveredMembers = async (customUrl?: string) => {
+    const url = (customUrl || employeeInfo.discordScraperUrl || 'https://discord-scraper-attendance-system.vercel.app').replace(/\/+$/, '');
+    setIsFetchingMembers(true);
+    setScraperStatusMessage('Connecting to Discord scraper...');
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
+      const res = await fetch(`${url}/api/users`, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
+      const data = await res.json();
+      const users = Array.isArray(data.users) ? data.users : [];
+      if (users.length === 0) {
+        setScraperStatusMessage('No members found in Discord history yet.');
+      } else {
+        setDiscoveredMembers(users);
+        setScraperStatusMessage(`Discovered ${users.length} members from scraper.`);
+      }
+    } catch (err: any) {
+      console.warn('Failed to load members from scraper:', err);
+      setScraperStatusMessage(`Notice: ${err.message || 'Unable to connect to scraper'}`);
+    } finally {
+      setIsFetchingMembers(false);
+    }
+  };
+
   const handleSyncDiscord = async () => {
     if (!employeeInfo.discordUsername) {
       alert('Please configure your Discord Username in Settings first.');
@@ -162,87 +196,154 @@ export default function App() {
     setIsSyncing(true);
     try {
       const targetMonth = filterMode === 'month' ? monthFilter : format(new Date(), 'yyyy-MM');
-      const res = await fetch(`https://discord-scraper-attendance-system.onrender.com/api/messages?month=${targetMonth}&username=${employeeInfo.discordUsername}`);
-      
+      const scraperBase = (employeeInfo.discordScraperUrl || 'https://discord-scraper-attendance-system.vercel.app').replace(/\/+$/, '');
+      const syncUrl = `${scraperBase}/api/messages?month=${targetMonth}&username=${encodeURIComponent(employeeInfo.discordUsername.trim())}`;
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 60000);
+      const res = await fetch(syncUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
       if (!res.ok) throw new Error(`API returned ${res.status}`);
-      
+
       const responseData = await res.json();
-      const messagesArray = responseData.messages;
-      
-      if (!Array.isArray(messagesArray)) throw new Error('Invalid format returned by scraper');
+      let messagesArray = Array.isArray(responseData.messages) ? responseData.messages : [];
+
+      // WORKAROUND: The scraper misattributes messages with reasons (e.g. BROWNOUT)
+      // to "Attendance Bot" username with viaAttendanceBot:false and null action/time.
+      // We fetch those separately and recover them by matching the employee name in content.
+      {
+        // Build all possible names to match against (settings name + discovered globalName)
+        const nameVariants: string[] = [];
+        if (employeeInfo.name) nameVariants.push(employeeInfo.name.toLowerCase());
+        const discoveredUser = discoveredMembers.find(u => u.username === employeeInfo.discordUsername);
+        if (discoveredUser?.globalName) nameVariants.push(discoveredUser.globalName.toLowerCase());
+
+        if (nameVariants.length > 0) {
+          try {
+            const botUrl = `${scraperBase}/api/messages?month=${targetMonth}&username=${encodeURIComponent('Attendance Bot')}`;
+            const botRes = await fetch(botUrl, { signal: AbortSignal.timeout(30000) });
+            if (botRes.ok) {
+              const botData = await botRes.json();
+              const botMessages = Array.isArray(botData.messages) ? botData.messages : [];
+              // Filter to only messages that mention this user's name and were not properly parsed
+              const recovered = botMessages.filter((m: any) => {
+                if (m.attendanceAction) return false; // Already properly parsed, skip
+                const c = String(m.content || '').toLowerCase();
+                return nameVariants.some(name => c.includes(name));
+              });
+              if (recovered.length > 0) {
+                messagesArray = [...messagesArray, ...recovered];
+              }
+            }
+          } catch (botErr) {
+            console.warn('Failed to fetch bot fallback messages:', botErr);
+          }
+        }
+      }
+
       if (messagesArray.length === 0) {
-        alert('No records found for this month/username!');
+        alert('No records found for this month/username on Discord!');
         return;
       }
-      
+
       const newRecords = { ...records };
-      
+
       // Process messages from oldest to newest to build daily records correctly
-      const sortedMessages = messagesArray.sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-      
+      const sortedMessages = [...messagesArray].sort((a: any, b: any) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      // Helper to parse manual time overrides like (7:35PM), {08:44}, (6:46)
+      const parseManualTime = (raw: string, baseDate: Date): string | null => {
+        const match = String(raw || '').match(/[\(\{]\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[\)\}]/i);
+        if (!match) return null;
+
+        let hour = Number(match[1]);
+        const minute = Number(match[2] || 0);
+        const meridiem = (match[3] || '').toLowerCase();
+
+        if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+
+        if (meridiem) {
+          if (hour < 1 || hour > 12) return null;
+          if (meridiem === 'pm' && hour !== 12) hour += 12;
+          if (meridiem === 'am' && hour === 12) hour = 0;
+        } else if (match[2] != null && match[2] !== '' && hour >= 0 && hour <= 23) {
+          // Explicit 24-hour time
+        } else {
+          const tsH = baseDate.getHours();
+          if (hour >= 1 && hour <= 12 && tsH >= 12 && hour !== 12) hour += 12;
+          if (hour === 12 && tsH < 12) hour = 0;
+          if (hour < 0 || hour > 23) return null;
+        }
+        return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+      };
+
       sortedMessages.forEach((m: any) => {
-         const content = m.content.toLowerCase();
-         
-         // Only process messages that belong to the correct name (if sent via bot)
-         if (m.viaAttendanceBot && !content.includes(employeeInfo.name.toLowerCase())) {
-            return;
-         }
-         
-         // Parse the Date from timestamp
-         const dateObj = new Date(m.timestamp);
-         const dateStr = format(dateObj, 'd-MMM-yy');
-         
-         if (!newRecords[dateStr]) {
-            newRecords[dateStr] = {
-               date: dateStr,
-               timeIn: '',
-               breakOut: '',
-               breakIn: '',
-               timeOut: '',
-               remarks: ''
-            };
-         }
-         
-         // Try to extract time from content like (08:44) or use the timestamp time
-         let timeStr = format(dateObj, 'HH:mm');
-         const timeMatch = m.content.match(/\((.*?)\)/);
-         if (timeMatch && timeMatch[1]) {
-             // Keep it simple, just extract the digits
-             const t = timeMatch[1].replace(/[^0-9:]/g, '');
-             if (t.includes(':')) {
-                 timeStr = t;
-                 // Quick am/pm fix if it was provided
-                 if (timeMatch[1].toLowerCase().includes('pm')) {
-                     const [h, min] = t.split(':');
-                     if (parseInt(h) < 12) timeStr = `${parseInt(h) + 12}:${min}`;
-                 }
-                 // Ensure HH:mm padding
-                 const parts = timeStr.split(':');
-                 timeStr = `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
-             }
-         }
-         
-         if (content.includes('break out')) {
-            newRecords[dateStr].breakOut = timeStr;
-         } else if (content.includes('break in')) {
-            newRecords[dateStr].breakIn = timeStr;
-         } else if (content.includes('out')) {
-            newRecords[dateStr].timeOut = timeStr;
-         } else if (content.includes('in')) {
-            // Check if timeIn already exists so we don't overwrite it with a later 'in'
-            if (!newRecords[dateStr].timeIn) {
-               newRecords[dateStr].timeIn = timeStr;
-            }
-         }
+        const rawContent = String(m.content || '');
+        const content = rawContent.toLowerCase();
+
+        // Only process messages that belong to the correct user
+        if (m.viaAttendanceBot && employeeInfo.name && !content.includes(employeeInfo.name.toLowerCase())) {
+          return;
+        }
+
+        const dateObj = new Date(m.timestamp);
+        if (Number.isNaN(dateObj.getTime())) return;
+        const dateStr = format(dateObj, 'd-MMM-yy');
+
+        if (!newRecords[dateStr]) {
+          newRecords[dateStr] = {
+            date: dateStr,
+            timeIn: '',
+            breakOut: '',
+            breakIn: '',
+            timeOut: '',
+            remarks: ''
+          };
+        }
+
+        // Attendance Bot Relay structured fields
+        if (m.viaAttendanceBot && m.attendanceAction && m.attendanceTime) {
+          const action = m.attendanceAction;
+          const time = String(m.attendanceTime);
+          if (action === 'in') newRecords[dateStr].timeIn = time;
+          else if (action === 'out') newRecords[dateStr].timeOut = time;
+          else if (action === 'breakOut') newRecords[dateStr].breakOut = time;
+          else if (action === 'breakIn') newRecords[dateStr].breakIn = time;
+          return;
+        }
+
+        // Default time from timestamp or manual override
+        const overrideTime = parseManualTime(rawContent, dateObj);
+        const timeStr = overrideTime || format(dateObj, 'HH:mm');
+
+        const hasBreakOut = /\bbreak\s+out\b/.test(content);
+        const hasBreakIn  = /\bbreak\s+in\b/.test(content);
+        const hasIn       = /(?<!break\s)\bin\s+@/.test(content) || (/\bin\b/.test(content) && !hasBreakIn);
+        const hasOut      = /(?<!break\s)\bout\s+@/.test(content) || (/\bout\b/.test(content) && !hasBreakOut);
+
+        if (hasBreakOut) {
+          newRecords[dateStr].breakOut = timeStr;
+        }
+        if (hasBreakIn) {
+          newRecords[dateStr].breakIn = timeStr;
+        }
+        if (hasIn) {
+          if (!newRecords[dateStr].timeIn) {
+            newRecords[dateStr].timeIn = timeStr;
+          }
+        }
+        if (hasOut) {
+          newRecords[dateStr].timeOut = timeStr;
+        }
       });
-      
+
       setPreviewRecords(newRecords);
       setIsSyncPreview(true);
       setIsPreviewOpen(true);
-      // alert(`Successfully synced ${Object.keys(newRecords).length} unique records from ${messagesArray.length} messages!`);
     } catch (e: any) {
       console.error(e);
-      alert('Failed to sync from Discord: ' + e.message);
+      alert('Failed to sync from Discord Scraper: ' + (e.name === 'AbortError' ? 'Request timed out after 60s. Please check connection or retry.' : e.message));
     } finally {
       setIsSyncing(false);
     }
@@ -268,7 +369,7 @@ export default function App() {
           setRecords({});
         }
       });
-      
+
       ipcRenderer.invoke('read-settings').then((data: EmployeeInfo) => {
         if (data && data.name) {
           setEmployeeInfo(data);
@@ -307,7 +408,7 @@ export default function App() {
   useEffect(() => {
     if (!employeeInfo.autoSyncEnabled || !employeeInfo.discordUsername) return;
     if (hasAutoSynced.current) return;
-    
+
     hasAutoSynced.current = true;
     setIsSyncing(true); // Show loading modal immediately
 
@@ -342,12 +443,25 @@ export default function App() {
     setIsSettingsOpen(false);
   };
 
-  const todayStr = format(currentTime, 'd-MMM-yy');
+  const handleRemarkChange = (date: string, remarks: string) => {
+    const existing = records[date] || { date, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
+    saveRecords({ ...records, [date]: { ...existing, remarks } });
+  };
+
+  const handleTimeEdit = (date: string, field: 'timeIn' | 'breakOut' | 'breakIn' | 'timeOut', value: string) => {
+    const existing = records[date] || { date, timeIn: '', breakOut: '', breakIn: '', timeOut: '', remarks: '' };
+    saveRecords({ ...records, [date]: { ...existing, [field]: value } });
+  };
+
+  // Track which cell is being edited: "date|field" or null
+  const [editingCell, setEditingCell] = useState<string | null>(null);
+  const [editingValue, setEditingValue] = useState('');
+
 
   const getTodayRecord = (): AttendanceRecord => {
     const todayStr = format(currentTime, 'd-MMM-yy');
     const yesterdayStr = format(new Date(currentTime.getTime() - 86400000), 'd-MMM-yy');
-    
+
     const todayRecordObj = records[todayStr];
     const yesterdayRecordObj = records[yesterdayStr];
 
@@ -375,7 +489,7 @@ export default function App() {
       const loc = location.trim() ? location.trim().toUpperCase() : (employeeInfo.workLocation || 'HOME');
       let message = '';
       const formattedReason = reason.trim() ? ` (${reason.trim().toUpperCase()})` : '';
-      
+
       if (type === 'timeIn') message = `IN @ ${loc}${formattedReason}`;
       else if (type === 'timeOut') message = `OUT @ ${loc}${formattedReason}`;
       else if (type === 'breakOut') message = `BREAK OUT @ ${loc}${formattedReason}`;
@@ -400,41 +514,10 @@ export default function App() {
 
   const [alarmTriggered, setAlarmTriggered] = useState(false);
 
-  const computeTodayWorkMins = () => {
-    const tIn = parseTime(todayRecord.timeIn);
-    if (tIn === null) return 0;
-
-    let tOut = parseTime(todayRecord.timeOut);
-    if (tOut === null) {
-      tOut = parseTime(format(currentTime, 'HH:mm'));
-    }
-
-    let officeMins = 0;
-    if (tOut !== null) {
-      officeMins = tOut - tIn;
-      if (officeMins < 0) officeMins += 24 * 60; // Handle overnight shift
-    }
-
-    let breakMins = 0;
-    const bOut = parseTime(todayRecord.breakOut);
-    if (bOut !== null) {
-      let bIn = parseTime(todayRecord.breakIn);
-      if (bIn === null && !todayRecord.timeOut) {
-        bIn = parseTime(format(currentTime, 'HH:mm'));
-      }
-      if (bIn !== null) {
-        breakMins = bIn - bOut;
-        if (breakMins < 0) breakMins += 24 * 60; // Handle overnight break
-      }
-    }
-
-    return Math.max(0, officeMins - breakMins);
-  };
-
   const computeTodayWorkSeconds = () => {
     const tInStr = todayRecord.timeIn;
     if (!tInStr) return 0;
-    
+
     const tInDate = new Date(currentTime);
     const [inH, inM] = tInStr.split(':').map(Number);
     tInDate.setHours(inH, inM, 0, 0);
@@ -500,12 +583,12 @@ export default function App() {
           osc.type = 'square';
           osc.frequency.setValueAtTime(800, audioCtx.currentTime);
           osc.frequency.setValueAtTime(1200, audioCtx.currentTime + 0.1);
-          
+
           gain.gain.setValueAtTime(0, audioCtx.currentTime);
           gain.gain.linearRampToValueAtTime(0.5, audioCtx.currentTime + 0.05);
           gain.gain.setValueAtTime(0.5, audioCtx.currentTime + 0.2);
           gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
-          
+
           osc.start(audioCtx.currentTime);
           osc.stop(audioCtx.currentTime + 0.3);
         };
@@ -527,7 +610,7 @@ export default function App() {
 
     const workSecs = computeTodayWorkSeconds();
     const targetSecs = (employeeInfo.alarmHours || 8) * 3600;
-    
+
     // Check if target hours is reached
     if (workSecs >= targetSecs && workSecs > 0 && !alarmTriggered && !todayRecord.timeOut) {
       setIsAlarmRinging(true);
@@ -568,7 +651,7 @@ export default function App() {
   const getHoliday = (date: Date): string => {
     const monthDay = format(date, 'MM-dd');
     if (PH_HOLIDAYS[monthDay]) return PH_HOLIDAYS[monthDay];
-    
+
     const fullDate = format(date, 'yyyy-MM-dd');
     if (MOVABLE_HOLIDAYS_2026[fullDate]) return MOVABLE_HOLIDAYS_2026[fullDate];
 
@@ -578,11 +661,11 @@ export default function App() {
   // Used for filtering the preview specifically
   const getFilteredList = (sourceRecords: Record<string, AttendanceRecord>) => {
     let targetDays: Date[] = [];
-    
+
     if (filterMode === 'month') {
       if (monthFilter) {
         const [year, month] = monthFilter.split('-');
-        
+
         // Generate all days in this month
         const daysInMonth = new Date(parseInt(year), parseInt(month), 0).getDate();
         for (let i = 1; i <= daysInMonth; i++) {
@@ -610,14 +693,14 @@ export default function App() {
 
     // Deduplicate and map
     const uniqueMap = new Map<string, AttendanceRecord>();
-    
+
     targetDays.forEach(d => {
       const isWeekend = d.getDay() === 0 || d.getDay() === 6;
       const dateStr = format(d, 'd-MMM-yy');
       const existing = sourceRecords[dateStr];
-      
+
       let remarks = existing?.remarks || '';
-      
+
       // Auto-detect holiday if remarks are empty
       if (!remarks) {
         const holiday = getHoliday(d);
@@ -640,12 +723,12 @@ export default function App() {
     });
 
     return Array.from(uniqueMap.values())
-      .sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   };
 
   const filteredRecordsList = getFilteredList(records);
   const filteredPreviewList = getFilteredList(previewRecords);
-  
+
   const recordsToDisplay = filteredRecordsList.filter(r => {
     if (tableTab === 'all') return true;
     return r.remarks && (r.remarks.toLowerCase().includes('leave') || r.remarks.toLowerCase().includes('holiday') || getHoliday(new Date(r.date)));
@@ -661,30 +744,33 @@ export default function App() {
     // Save any changes made in preview back to the main DB
     saveRecords(previewRecords);
 
-    if (ipcRenderer) {
-      const filteredDict: Record<string, AttendanceRecord> = {};
-      filteredPreviewList.forEach(r => filteredDict[r.date] = r);
-      
-      let computedPeriod = "All Records";
-      
-      if (filterMode === 'month' && monthFilter) {
-        const [year, month] = monthFilter.split('-');
-        computedPeriod = format(new Date(parseInt(year), parseInt(month) - 1, 1), 'MMMM yyyy');
-      } else if (filterMode === 'range') {
-        if (startDate && endDate) {
-          computedPeriod = `${format(new Date(startDate), 'MMMM d, yyyy')} to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
-        } else if (startDate) {
-          computedPeriod = `From ${format(new Date(startDate), 'MMMM d, yyyy')}`;
-        } else if (endDate) {
-          computedPeriod = `Up to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
-        }
-      }
+    const filteredDict: Record<string, AttendanceRecord> = {};
+    filteredPreviewList.forEach(r => {
+      filteredDict[r.date] = r;
+    });
 
-      const infoToExport = { ...employeeInfo, payrollPeriod: computedPeriod };
+    let computedPeriod = "All Records";
+
+    if (filterMode === 'month' && monthFilter) {
+      const [year, month] = monthFilter.split('-');
+      computedPeriod = format(new Date(parseInt(year), parseInt(month) - 1, 1), 'MMMM yyyy');
+    } else if (filterMode === 'range') {
+      if (startDate && endDate) {
+        computedPeriod = `${format(new Date(startDate), 'MMMM d, yyyy')} to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
+      } else if (startDate) {
+        computedPeriod = `From ${format(new Date(startDate), 'MMMM d, yyyy')}`;
+      } else if (endDate) {
+        computedPeriod = `Up to ${format(new Date(endDate), 'MMMM d, yyyy')}`;
+      }
+    }
+
+    const infoToExport = { ...employeeInfo, payrollPeriod: computedPeriod };
+
+    if (ipcRenderer) {
       ipcRenderer.invoke('export-excel', filteredDict, infoToExport);
     } else {
       // Browser / APK Fallback for Excel Export
-      exportExcelWeb(filteredDict, { ...employeeInfo, payrollPeriod: computedPeriod });
+      exportExcelWeb(filteredDict, infoToExport);
     }
     setIsPreviewOpen(false);
   };
@@ -735,8 +821,8 @@ export default function App() {
           const bOut = parseTime(r.breakOut);
           const bIn = parseTime(r.breakIn);
           if (bOut !== null && bIn !== null) {
-             const breakDuration = bIn - bOut;
-             if (breakDuration > 0) mins -= breakDuration;
+            const breakDuration = bIn - bOut;
+            if (breakDuration > 0) mins -= breakDuration;
           }
           if (mins < 0) mins = 0;
 
@@ -857,45 +943,45 @@ export default function App() {
           <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm overflow-hidden p-6 animate-in fade-in zoom-in-95 duration-200">
             <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Confirm Punch Time</h3>
             <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">Adjust the time if you forgot to punch earlier.</p>
-            
+
             <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Time</label>
-            <input 
+            <input
               autoFocus={punchPromptType !== 'breakOut'}
-              type="time" 
+              type="time"
               value={punchPromptTime}
               onChange={e => setPunchPromptTime(e.target.value)}
               className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
             />
 
-                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Location</label>
-                <input 
-                  type="text" 
-                  value={punchPromptLocation}
-                  onChange={e => setPunchPromptLocation(e.target.value)}
-                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm"
-                  placeholder="e.g. HOME, TRANCO OFFICE"
-                />
+            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Location</label>
+            <input
+              type="text"
+              value={punchPromptLocation}
+              onChange={e => setPunchPromptLocation(e.target.value)}
+              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm"
+              placeholder="e.g. HOME, TRANCO OFFICE"
+            />
 
-                <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Reason (Optional)</label>
-                <textarea 
-                  rows={1}
-                  autoFocus={punchPromptType === 'breakOut'}
-                  value={punchPromptReason}
-                  onChange={e => {
-                    setPunchPromptReason(e.target.value);
-                    e.target.style.height = 'auto';
-                    e.target.style.height = `${e.target.scrollHeight}px`;
-                  }}
-                  onKeyDown={e => {
-                     if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
-                        setPunchPromptOpen(false);
-                     }
-                  }}
-                  className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm resize-none overflow-hidden"
-                  placeholder="e.g. LUNCH, BROWNOUT"
-                />
+            <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Reason (Optional)</label>
+            <textarea
+              rows={1}
+              autoFocus={punchPromptType === 'breakOut'}
+              value={punchPromptReason}
+              onChange={e => {
+                setPunchPromptReason(e.target.value);
+                e.target.style.height = 'auto';
+                e.target.style.height = `${e.target.scrollHeight}px`;
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handlePunch(punchPromptType, punchPromptTime, punchPromptLocation, punchPromptReason);
+                  setPunchPromptOpen(false);
+                }
+              }}
+              className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-6 text-sm resize-none overflow-hidden"
+              placeholder="e.g. LUNCH, BROWNOUT"
+            />
 
             <div className="flex justify-end gap-3 mt-2">
               <button onClick={() => setPunchPromptOpen(false)} className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
@@ -928,17 +1014,18 @@ export default function App() {
                 alarmHours: Number(formData.get('alarmHours')) || 8,
                 discordWebhook: formData.get('discordWebhook') as string,
                 discordUsername: formData.get('discordUsername') as string,
+                discordScraperUrl: ((formData.get('discordScraperUrl') as string) || 'https://discord-scraper-attendance-system.vercel.app').trim(),
                 autoSyncEnabled: formData.get('autoSyncEnabled') === 'on',
                 theme: employeeInfo.theme,
                 workLocation: (formData.get('workLocation') as string) || 'HOME',
               });
             }} className="p-6 overflow-y-auto flex-1">
-              
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 {/* Left Column: Personal Info */}
                 <div className="flex flex-col gap-4">
-                  <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><User size={16} className="text-blue-500 dark:text-blue-400"/> Personal Details</h4>
-                  
+                  <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><User size={16} className="text-blue-500 dark:text-blue-400" /> Personal Details</h4>
+
                   <div>
                     <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Full Name <span className="text-red-500">*</span></label>
                     <input name="name" defaultValue={employeeInfo.name} required className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
@@ -959,11 +1046,11 @@ export default function App() {
 
                 {/* Right Column: Integrations & Alarms */}
                 <div className="flex flex-col gap-6">
-                  
+
                   {/* Alarm Settings */}
                   <div className="flex flex-col gap-4">
-                    <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><Clock size={16} className="text-blue-500 dark:text-blue-400"/> Alarm Settings</h4>
-                    
+                    <h4 className="font-bold text-zinc-800 dark:text-zinc-200 text-sm flex items-center gap-2 border-b border-zinc-100 dark:border-zinc-800 pb-2"><Clock size={16} className="text-blue-500 dark:text-blue-400" /> Alarm Settings</h4>
+
                     <div className="flex items-center justify-between">
                       <div>
                         <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300">Enable Shift Alarm</label>
@@ -990,9 +1077,82 @@ export default function App() {
                       <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">Punches (Time In, Time Out, etc.) will be automatically sent to your Discord channel.</p>
                     </div>
                     <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Discord Scraper API URL <span className="text-red-500">*</span></label>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const input = document.querySelector('input[name="discordScraperUrl"]') as HTMLInputElement;
+                            if (input) input.value = 'https://discord-scraper-attendance-system.vercel.app';
+                          }}
+                          className="text-xs text-blue-600 dark:text-blue-400 hover:underline font-medium"
+                        >
+                          Default Vercel
+                        </button>
+                      </div>
+                      <div className="flex gap-2">
+                        <input
+                          name="discordScraperUrl"
+                          type="url"
+                          required
+                          defaultValue={employeeInfo.discordScraperUrl || 'https://discord-scraper-attendance-system.vercel.app'}
+                          placeholder="https://discord-scraper-attendance-system.vercel.app"
+                          className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm font-mono"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const input = document.querySelector('input[name="discordScraperUrl"]') as HTMLInputElement;
+                            fetchDiscoveredMembers(input?.value);
+                          }}
+                          disabled={isFetchingMembers}
+                          className="px-3 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800 rounded-lg text-xs font-bold hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-colors flex items-center gap-1.5 shrink-0 disabled:opacity-50"
+                        >
+                          <Users size={14} className={isFetchingMembers ? "animate-spin" : ""} />
+                          {isFetchingMembers ? "Connecting..." : "Load Members"}
+                        </button>
+                      </div>
+                      {scraperStatusMessage && (
+                        <p className="text-xs text-blue-600 dark:text-blue-400 mt-1.5 flex items-center gap-1">
+                          <CheckCircle2 size={12} /> {scraperStatusMessage}
+                        </p>
+                      )}
+                    </div>
+                    <div>
                       <label className="block text-sm font-semibold text-zinc-700 dark:text-zinc-300 mb-1">Discord Username (For Syncing) <span className="text-red-500">*</span></label>
-                      <input name="discordUsername" type="text" required defaultValue={employeeInfo.discordUsername} placeholder="e.g. kimcastor6066" className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 font-mono text-sm" />
-                      <p className="text-xs text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1">Used to pull past records from the Discord Scraper API.</p>
+                      {discoveredMembers.length > 0 ? (
+                        <>
+                          <select
+                            name="discordUsername"
+                            defaultValue={employeeInfo.discordUsername || ''}
+                            className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 font-mono text-sm cursor-pointer"
+                            onChange={(e) => {
+                              const selectedUsername = e.target.value;
+                              if (!selectedUsername) return;
+                              const found = discoveredMembers.find(u => u.username === selectedUsername);
+                              if (found?.globalName) {
+                                const nameInput = document.querySelector('input[name="name"]') as HTMLInputElement;
+                                if (nameInput && (!nameInput.value || nameInput.value === 'John Doe')) {
+                                  nameInput.value = found.globalName;
+                                }
+                              }
+                            }}
+                          >
+                            <option value="">-- Select Your Username --</option>
+                            {discoveredMembers.map((user) => (
+                              <option key={user.username} value={user.username}>
+                                {user.globalName || user.username} (@{user.username})
+                              </option>
+                            ))}
+                          </select>
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Select your Discord username from {discoveredMembers.length} discovered members.</p>
+                        </>
+                      ) : (
+                        <>
+                          <input name="discordUsername" type="text" required defaultValue={employeeInfo.discordUsername} placeholder="e.g. kimcastor6066" className="w-full border border-zinc-300 dark:border-zinc-700 rounded-lg px-3 py-2 outline-none bg-transparent focus:border-blue-500 focus:ring-1 focus:ring-blue-500 font-mono text-sm" />
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Used to pull past records from the Discord Scraper API. Click "Load Members" above to pick from a list.</p>
+                        </>
+                      )}
                     </div>
                     <div className="flex items-center justify-between">
                       <div>
@@ -1010,7 +1170,7 @@ export default function App() {
               </div>
 
               <div className="mt-8 pt-4 border-t border-zinc-100 dark:border-zinc-800 flex flex-col gap-4">
-                
+
                 {/* Backup & Import */}
                 <div className="flex flex-col sm:flex-row gap-3 border border-zinc-200/50 dark:border-zinc-800 p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900/50 justify-between items-center">
                   <div className="text-sm">
@@ -1018,35 +1178,35 @@ export default function App() {
                     <p className="text-xs text-zinc-500 dark:text-zinc-400">Backup your data as a JSON file, or restore from a previous backup.</p>
                   </div>
                   <div className="flex gap-2 w-full sm:w-auto">
-                    <button 
-                      type="button" 
+                    <button
+                      type="button"
                       onClick={handleExportBackup}
                       className="flex-1 sm:flex-none justify-center flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors shadow-sm"
                     >
                       <Download size={14} /> Backup Data
                     </button>
-                    
-                    <button 
-                      type="button" 
+
+                    <button
+                      type="button"
                       onClick={() => fileInputRef.current?.click()}
                       className="flex-1 sm:flex-none justify-center flex items-center gap-1.5 px-3 py-1.5 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition-colors shadow-sm"
                     >
                       <Upload size={14} /> Import JSON
                     </button>
-                    <input 
-                      type="file" 
-                      accept=".json" 
-                      ref={fileInputRef} 
-                      onChange={handleImportBackup} 
-                      className="hidden" 
+                    <input
+                      type="file"
+                      accept=".json"
+                      ref={fileInputRef}
+                      onChange={handleImportBackup}
+                      className="hidden"
                     />
                   </div>
                 </div>
 
                 {/* Footer Buttons */}
                 <div className="flex justify-between items-center">
-                  <button 
-                    type="button" 
+                  <button
+                    type="button"
                     onClick={() => setIsResetConfirmOpen(true)}
                     className="text-red-500 hover:text-red-600 dark:text-red-400 dark:hover:text-red-300 font-medium px-4 py-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-500/10 transition-colors text-sm"
                   >
@@ -1073,13 +1233,13 @@ export default function App() {
               <h3 className="font-bold text-lg text-zinc-900 dark:text-zinc-100 mb-2">Save Details?</h3>
               <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-6">Are you sure you want to save these changes to your settings and preferences?</p>
               <div className="flex gap-3 justify-center">
-                <button 
+                <button
                   onClick={() => setPendingSettings(null)}
                   className="px-4 py-2 font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-xl transition-colors"
                 >
                   Cancel
                 </button>
-                <button 
+                <button
                   onClick={() => {
                     if (pendingSettings) {
                       saveSettings(pendingSettings);
@@ -1104,7 +1264,10 @@ export default function App() {
               <RefreshCw size={32} className="animate-spin" />
             </div>
             <h3 className="font-bold text-xl text-zinc-900 dark:text-white mb-2">Syncing with Discord...</h3>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">Please wait while we fetch your latest attendance records. This may take a few moments.</p>
+            <p className="text-sm text-zinc-500 dark:text-zinc-400">Fetching latest attendance records from Discord Scraper.</p>
+            <p className="text-xs text-blue-600 dark:text-blue-400 mt-3 font-mono truncate px-2 py-1 bg-blue-50/50 dark:bg-blue-950/40 rounded-lg border border-blue-200/50 dark:border-blue-800/40">
+              {employeeInfo.discordScraperUrl || 'https://discord-scraper-attendance-system.vercel.app'}
+            </p>
           </div>
         </div>
       )}
@@ -1118,7 +1281,7 @@ export default function App() {
             </div>
             <h3 className="font-black text-2xl text-red-600 dark:text-red-400 mb-2 uppercase tracking-widest">Shift Complete!</h3>
             <p className="text-zinc-600 dark:text-zinc-400 mb-8 font-medium">You have reached your target of {employeeInfo.alarmHours || 8} hours.</p>
-            
+
             <button onClick={() => setIsAlarmRinging(false)} className="w-full py-4 bg-red-600 hover:bg-red-700 text-white rounded-xl transition-colors font-black text-lg shadow-lg shadow-red-600/30 tracking-widest uppercase">
               Stop Alarm
             </button>
@@ -1132,7 +1295,7 @@ export default function App() {
           <div className="bg-white/70 dark:bg-[#0a0a0a]/80 backdrop-blur-3xl rounded-3xl shadow-2xl border border-red-500/20 dark:border-red-500/10 w-full max-w-sm overflow-hidden p-6 animate-in fade-in zoom-in-95 duration-200">
             <h3 className="font-bold text-lg text-red-600 dark:text-red-400 mb-2">Delete All Data?</h3>
             <p className="text-sm text-zinc-600 dark:text-zinc-400 mb-6">Are you absolutely sure you want to wipe the database? This action cannot be undone and you will lose all attendance history.</p>
-            
+
             <div className="flex justify-end gap-3">
               <button onClick={() => setIsResetConfirmOpen(false)} className="px-4 py-2 rounded-xl text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm">Cancel</button>
               <button onClick={() => {
@@ -1157,13 +1320,13 @@ export default function App() {
             <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Delete Record?</h3>
             <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-6">Are you sure you want to permanently delete the attendance record for <strong>{recordToDelete}</strong>?</p>
             <div className="flex justify-end gap-3">
-              <button 
+              <button
                 onClick={() => setRecordToDelete(null)}
                 className="px-4 py-2 rounded-xl text-zinc-500 hover:bg-zinc-100 dark:hover:bg-white/5 transition-colors font-medium text-sm"
               >
                 Cancel
               </button>
-              <button 
+              <button
                 onClick={() => {
                   if (recordToDelete) {
                     const newRecords = { ...records };
@@ -1187,7 +1350,7 @@ export default function App() {
           <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-3xl shadow-xl border border-zinc-200/50 dark:border-white/5 w-full max-w-sm max-h-[90dvh] flex flex-col overflow-y-auto p-6 animate-in fade-in zoom-in-95 duration-200">
             <h3 className="font-bold text-lg text-zinc-900 dark:text-white mb-2">Add Future Leave</h3>
             <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-4">Mark a future date as Leave, Absent, or Holiday.</p>
-            
+
             <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date Mode</label>
             <select
               value={leaveMode}
@@ -1201,8 +1364,8 @@ export default function App() {
             {leaveMode === 'single' ? (
               <>
                 <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Date</label>
-                <input 
-                  type="date" 
+                <input
+                  type="date"
                   value={leaveDateInput}
                   onChange={e => setLeaveDateInput(e.target.value)}
                   className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 mb-4 text-sm font-mono"
@@ -1212,8 +1375,8 @@ export default function App() {
               <div className="flex gap-4 mb-4">
                 <div className="flex-1">
                   <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Start Date</label>
-                  <input 
-                    type="date" 
+                  <input
+                    type="date"
                     value={leaveDateInput}
                     onChange={e => setLeaveDateInput(e.target.value)}
                     className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 text-sm font-mono"
@@ -1221,8 +1384,8 @@ export default function App() {
                 </div>
                 <div className="flex-1">
                   <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">End Date</label>
-                  <input 
-                    type="date" 
+                  <input
+                    type="date"
                     value={leaveEndDateInput}
                     onChange={e => setLeaveEndDateInput(e.target.value)}
                     className="w-full bg-white dark:bg-black/50 border border-zinc-200/50 dark:border-white/10 rounded-xl px-4 py-3 outline-none focus:border-blue-500 text-sm font-mono"
@@ -1232,7 +1395,7 @@ export default function App() {
             )}
 
             <label className="block text-xs font-bold text-zinc-700 dark:text-zinc-300 mb-1 uppercase tracking-wider">Leave Type / Remark</label>
-            <textarea 
+            <textarea
               rows={1}
               value={leaveRemarkInput}
               onChange={e => {
@@ -1295,8 +1458,8 @@ export default function App() {
                   {isSyncPreview ? "Preview Scraped Data" : "Preview & Edit Data"}
                 </h3>
                 <p className="text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-500">
-                  {isSyncPreview 
-                    ? "Review the scraped attendance records before applying them to your dashboard." 
+                  {isSyncPreview
+                    ? "Review the scraped attendance records before applying them to your dashboard."
                     : "Make any final adjustments before generating the Excel file."}
                 </p>
               </div>
@@ -1350,7 +1513,7 @@ export default function App() {
               <button onClick={() => setIsPreviewOpen(false)} className="px-5 py-2 rounded-lg font-medium text-zinc-600 dark:text-zinc-400 dark:text-zinc-500 hover:bg-zinc-200 dark:bg-zinc-700 dark:hover:bg-zinc-700 transition-colors">
                 Cancel
               </button>
-              
+
               {isSyncPreview ? (
                 <button onClick={handleConfirmSync} className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 rounded-lg flex items-center gap-2 shadow-sm dark:shadow-none transition-colors active:scale-95" disabled={filteredPreviewList.length === 0}>
                   <RefreshCw size={18} />
@@ -1374,7 +1537,7 @@ export default function App() {
 
           {/* Clock Card */}
           <div className="bg-white/70 dark:bg-[#0a0a0a]/60 backdrop-blur-3xl rounded-xl border border-zinc-200/50 dark:border-white/[0.08] p-8 flex flex-col justify-center items-center relative overflow-hidden transition-colors">
-            
+
             <div className="flex items-center gap-2 text-blue-600 dark:text-blue-400 mb-3">
               <Calendar size={18} />
               <span className="font-semibold text-sm">{format(currentTime, 'EEEE, MMMM do, yyyy')}</span>
@@ -1392,7 +1555,7 @@ export default function App() {
                 <Clock size={20} className="text-zinc-400 dark:text-zinc-500" />
                 Daily Attendance Terminal
               </h2>
-              
+
               <div className="bg-blue-50 dark:bg-blue-950/50 border border-blue-100 dark:border-blue-900/50 px-4 py-2 rounded-xl flex flex-col items-end shadow-sm dark:shadow-none">
                 <span className="text-[10px] uppercase font-bold text-blue-500 dark:text-blue-400 tracking-wider">Total Work Today</span>
                 <span className="text-xl font-bold font-mono text-blue-700 dark:text-blue-400">{computeTodayWork()}</span>
@@ -1466,13 +1629,13 @@ export default function App() {
             <div>
               <h2 className="text-lg font-bold text-zinc-900 dark:text-white">Attendance Log & Computations</h2>
               <p className="text-sm text-zinc-500 dark:text-zinc-400 dark:text-zinc-500 mt-1 font-medium">Review your daily records and computed hours</p>
-              
+
               <div className="flex items-center gap-1 mt-4 bg-zinc-200/50 dark:bg-zinc-900 p-1 rounded-xl w-fit">
-                <button 
+                <button
                   onClick={() => setTableTab('all')}
                   className={`px-4 py-1.5 rounded-lg text-sm font-bold transition-all ${tableTab === 'all' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}
                 >All Records</button>
-                <button 
+                <button
                   onClick={() => setTableTab('leaves')}
                   className={`px-4 py-1.5 rounded-lg text-sm font-bold transition-all ${tableTab === 'leaves' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-white shadow-sm' : 'text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300'}`}
                 >Leaves & Holidays</button>
@@ -1613,10 +1776,47 @@ export default function App() {
                   return (
                     <tr key={record.date} className="border-b border-zinc-100 dark:border-white/5 hover:bg-zinc-50 dark:hover:bg-white/5 dark:bg-transparent transition-colors group">
                       <td className="py-4 px-6 font-semibold text-zinc-900 dark:text-white whitespace-nowrap">{record.date}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.timeIn || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.breakOut || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.breakIn || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
-                      <td className="py-4 px-6 text-center font-mono">{record.timeOut || <span className="text-zinc-300 dark:text-zinc-700">—</span>}</td>
+                      {(['timeIn', 'breakOut', 'breakIn', 'timeOut'] as const).map((field) => {
+                        const cellKey = `${record.date}|${field}`;
+                        const isEditing = editingCell === cellKey;
+                        const value = record[field];
+                        return (
+                          <td key={field} className="py-3 px-6 text-center font-mono">
+                            {isEditing ? (
+                              <input
+                                type="time"
+                                autoFocus
+                                value={editingValue}
+                                onChange={(e) => setEditingValue(e.target.value)}
+                                onBlur={() => {
+                                  handleTimeEdit(record.date, field, editingValue);
+                                  setEditingCell(null);
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    handleTimeEdit(record.date, field, editingValue);
+                                    setEditingCell(null);
+                                  } else if (e.key === 'Escape') {
+                                    setEditingCell(null);
+                                  }
+                                }}
+                                className="w-full bg-white dark:bg-zinc-900 border border-blue-500 rounded px-2 py-1 outline-none text-sm font-mono text-center focus:ring-2 focus:ring-blue-200 dark:focus:ring-blue-800"
+                              />
+                            ) : (
+                              <span
+                                onClick={() => {
+                                  setEditingCell(cellKey);
+                                  setEditingValue(value);
+                                }}
+                                className="cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 hover:text-blue-600 dark:hover:text-blue-400 px-2 py-1 rounded transition-colors inline-block min-w-[3.5rem]"
+                                title="Click to edit"
+                              >
+                                {value || <span className="text-zinc-300 dark:text-zinc-700">—</span>}
+                              </span>
+                            )}
+                          </td>
+                        );
+                      })}
 
                       <td className="py-4 px-6 text-center font-mono font-bold text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/10">
                         {showComputations ? formatMinutes(workMins) : <span className="text-zinc-300 dark:text-zinc-700">—</span>}

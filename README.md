@@ -11,7 +11,8 @@ Developed by **Kim Castor**.
 - **Future Leaves:** Dedicated modal to schedule future leaves and holidays seamlessly.
 - **Data Exporting:** Instantly export formatted Excel reports with professional color coding (e.g., green for holidays, blue for leaves) for HR and payroll.
 - **Backup & Restore:** Never lose your data. Download JSON backup files and import them locally across different machines.
-- **Discord Integration:** Optional Webhook support to broadcast punches to a specific Discord channel in real-time.
+- **Discord Integration & Sync:** Optional Webhook support to broadcast punches to a Discord channel in real-time, plus one-click historical attendance syncing via the [Discord Scraper API](https://discord-scraper-attendance-system.vercel.app/).
+- **Member Auto-Discovery:** Load and select Discord server members directly from the Scraper API (`/api/users`) to auto-fill usernames and IDs.
 - **Customizable UI:** Toggle between Light and Dark mode, or let the app follow your system theme.
 
 ## 🛠 Tech Stack
